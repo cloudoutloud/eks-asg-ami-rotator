@@ -1,11 +1,8 @@
-# asg-ami-rotator
+# eks-asg-ami-rotator
 
 A Kubernetes controller that keeps a set of EC2 Auto Scaling Groups (ASGs)
 rolled onto their current AMI, one node at a time, draining each node gracefully
 through the Kubernetes API.
-
-It is the automated, in-cluster successor to the `rotate-asg-standby.sh` and
-`rotate-asg-terminate.sh` scripts in the parent directory.
 
 ## Why
 
@@ -50,6 +47,15 @@ On a timer, for each managed ASG:
 Instance → Node mapping is done via the node's `spec.providerID`
 (`aws:///<az>/<instance-id>`).
 
+## Notes & safety
+
+- **One instance at a time**, and each step waits for the ASG to be healthy
+  before proceeding — a failed drain or unhealthy replacement halts the roll.
+- Cleanup (restore `MaxSize`, resume `AZRebalance`) runs even if the process is
+  cancelled mid-roll.
+- Because it drains via the Kube API directly, it does **not** require
+  aws-node-termination-handler or ASG lifecycle hooks.
+
 ## Configuration
 
 Flags (each has an env fallback, shown in parentheses):
@@ -73,6 +79,8 @@ Flags (each has an env fallback, shown in parentheses):
 | `--leader-elect` | `LEADER_ELECT` | `true` | Leader election (safe with >1 replica). |
 
 ## AWS permissions (IRSA)
+
+Pre req your need to create an IAM role for the controller.
 
 Attach the policy in [`deploy/iam-policy.json`](deploy/iam-policy.json) to the
 IAM role referenced by the ServiceAccount's `eks.amazonaws.com/role-arn`
@@ -159,7 +167,7 @@ Or roll out a new tag against a running deployment:
 kubectl -n <namespace> set image deployment/asg-ami-rotator controller="$IMAGE"
 ```
 
-## Local dry-run
+## Local dry-run (Optional)
 
 ```bash
 make run ASG_NAMES=my-bootstrap-asg AWS_REGION=eu-west-2
@@ -167,12 +175,3 @@ make run ASG_NAMES=my-bootstrap-asg AWS_REGION=eu-west-2
 
 This uses your local kubeconfig and AWS credentials, disables leader election,
 and only logs what it *would* do.
-
-## Notes & safety
-
-- **One instance at a time**, and each step waits for the ASG to be healthy
-  before proceeding — a failed drain or unhealthy replacement halts the roll.
-- Cleanup (restore `MaxSize`, resume `AZRebalance`) runs even if the process is
-  cancelled mid-roll.
-- Because it drains via the Kube API directly, it does **not** require
-  aws-node-termination-handler or ASG lifecycle hooks.
