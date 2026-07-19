@@ -1,0 +1,15 @@
+# syntax=docker/dockerfile:1
+#
+# Minimal image around a binary that was cross-compiled on the host. Use this to
+# avoid compiling the (very large) dependency tree inside a resource-limited
+# Docker/BuildKit VM.
+#
+#   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" \
+#     -o controller ./cmd/controller
+#   docker buildx build --platform linux/amd64 -f Dockerfile.prebuilt -t "$IMAGE" --load .
+#
+FROM gcr.io/distroless/static:nonroot
+WORKDIR /
+COPY controller /controller
+USER 65532:65532
+ENTRYPOINT ["/controller"]
