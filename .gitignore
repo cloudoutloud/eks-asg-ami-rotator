@@ -1,0 +1,21 @@
+# Compiled binaries / build output
+/controller
+/bin/
+*.exe
+*.out
+
+# Test & coverage artifacts
+*.test
+coverage.out
+coverage.html
+
+# Local env / credentials
+*.env
+.env
+.env.*
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp

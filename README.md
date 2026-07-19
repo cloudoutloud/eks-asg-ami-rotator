@@ -34,9 +34,12 @@ On a timer, for each managed ASG:
 5. For each stale instance, **one at a time**:
    1. `EnterStandby` (without decrementing desired) → the ASG launches a
       replacement on the new AMI.
-   2. **Cordon and drain** the backing Kubernetes node (respects
+   2. **Wait for the replacement to be usable** before touching the old node:
+      first until it is `InService`/`Healthy` at the ASG level, then until its
+      Kubernetes Node has joined the cluster and reports `Ready` (and is
+      schedulable). This guarantees evicted pods have somewhere to land.
+   3. **Cordon and drain** the backing Kubernetes node (respects
       PodDisruptionBudgets; ignores DaemonSets).
-   3. **Wait until the group is healthy** (the replacement is `InService`).
    4. **Delete the Node** object.
    5. **Terminate** the old instance through the ASG with
       `TerminateInstanceInAutoScalingGroup` **without decrementing desired**, so
@@ -83,12 +86,77 @@ create evictions, read workload controllers, and manage a leader-election lease.
 
 ## Build & deploy
 
+### Build and push the image (ECR)
+
+First set the tag/image and log in to ECR:
+
+```bash
+export TAG=v0.2.0
+export IMAGE=ACCOUNT_ID.dkr.ecr.eu-west-2.amazonaws.com/images/asg-ami-rotater:$TAG
+
+aws ecr get-login-password --region eu-west-2 \
+  | docker login --username AWS --password-stdin ACCOUNT_ID.dkr.ecr.eu-west-2.amazonaws.com
+```
+
+EKS nodes are typically `amd64` — swap `linux/amd64` for `linux/arm64` on
+Graviton nodes.
+
+#### Recommended: compile on the host, then package the binary
+
+The dependency tree (`client-go` + `kubectl` + `controller-runtime` + AWS SDK)
+is large and its Go linker needs several GB of RAM. Compiling it **inside** a
+resource-limited BuildKit VM (e.g. Rancher/Docker Desktop, especially when a
+local `kind` cluster is also running) can thrash and appear to hang. Compiling
+on the host is fast and avoids that. [`Dockerfile.prebuilt`](Dockerfile.prebuilt)
+just copies the binary into a `distroless` image.
+
+```bash
+# 1) Cross-compile for the cluster's arch on the host
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" \
+  -o controller ./cmd/controller
+
+# 2) Package the binary (loads the image into the local Docker engine)
+docker buildx build --platform linux/amd64 -f Dockerfile.prebuilt -t "$IMAGE" --load .
+
+# 3) Push
+docker push "$IMAGE"
+```
+
+The `controller` binary is gitignored, so it is never committed.
+
+#### Alternative: build everything inside Docker
+
+Uses the multi-stage [`Dockerfile`](Dockerfile) (with build-cache mounts).
+Simpler, but the first cold build can take several minutes and needs a BuildKit
+VM with enough memory (bump Docker/Rancher Desktop to 6–8 GB).
+
+```bash
+# 1) Build (loads the image into the local Docker engine)
+docker buildx build --platform linux/amd64 -t "$IMAGE" --load .
+
+# 2) Push
+docker push "$IMAGE"
+```
+
+Optionally tag the matching git commit:
+
+```bash
+git tag -a "$TAG" -m "$TAG" && git push origin "$TAG"
+```
+
+### Deploy
+
 ```bash
 make tidy          # resolve go.sum
-make build         # build the binary
-make docker IMAGE=<your-registry>/asg-ami-rotator:tag
+make build         # build the binary locally (optional)
 # edit deploy/*.yaml: image, ASG_NAMES, AWS_REGION, IRSA role ARN
 make deploy
+```
+
+Or roll out a new tag against a running deployment:
+
+```bash
+kubectl -n <namespace> set image deployment/asg-ami-rotator controller="$IMAGE"
 ```
 
 ## Local dry-run

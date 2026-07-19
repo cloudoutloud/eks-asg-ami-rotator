@@ -9,9 +9,16 @@ ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+# Cache the module downloads so repeated builds don't re-fetch every dependency.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" \
+# Cache the module and compiler caches. The first build still has to compile the
+# large client-go/kubectl/controller-runtime tree (can take several minutes on a
+# small Docker VM); subsequent builds reuse this cache and finish in seconds.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" \
     -o /out/controller ./cmd/controller
 
 FROM gcr.io/distroless/static:nonroot

@@ -215,6 +215,55 @@ func (c *Client) InstanceAMIs(ctx context.Context, ids []string) (map[string]str
 	return result, nil
 }
 
+// InServiceInstanceIDs returns the IDs of instances currently InService in the
+// group. Used to snapshot the group before a surge so the newly launched
+// replacement can be identified afterwards.
+func (c *Client) InServiceInstanceIDs(ctx context.Context, name string) ([]string, error) {
+	gs, err := c.DescribeGroup(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, in := range gs.Instances {
+		if in.LifecycleState == "InService" {
+			ids = append(ids, in.ID)
+		}
+	}
+	return ids, nil
+}
+
+// WaitForNewInService blocks until a new InService+Healthy instance (one not in
+// the provided known set) appears, returning its ID. This is how the rotator
+// identifies the surge replacement the ASG launches after an instance enters
+// Standby.
+func (c *Client) WaitForNewInService(ctx context.Context, name string, known []string, timeout, poll time.Duration, log func(string, ...any)) (string, error) {
+	knownSet := make(map[string]struct{}, len(known))
+	for _, id := range known {
+		knownSet[id] = struct{}{}
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		gs, err := c.DescribeGroup(ctx, name)
+		if err != nil {
+			return "", err
+		}
+		for _, in := range gs.Instances {
+			if in.LifecycleState != "InService" || in.HealthStatus != "Healthy" {
+				continue
+			}
+			if _, ok := knownSet[in.ID]; !ok {
+				return in.ID, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("timed out after %s waiting for a replacement instance in asg %q", timeout, name)
+		}
+		if err := sleep(ctx, poll); err != nil {
+			return "", err
+		}
+	}
+}
+
 // EnterStandby moves an instance to Standby without decrementing desired
 // capacity, so the ASG launches a replacement on the current AMI.
 func (c *Client) EnterStandby(ctx context.Context, asgName, instanceID string) error {

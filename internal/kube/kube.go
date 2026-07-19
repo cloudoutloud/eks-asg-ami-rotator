@@ -69,6 +69,57 @@ func (c *Client) NodeForInstance(ctx context.Context, instanceID string) (*corev
 	return nil, nil
 }
 
+// WaitForNodeReady blocks until the Node backing instanceID has joined the
+// cluster and reports Ready=True (and is not cordoned/unschedulable), or the
+// timeout elapses. This ensures the surge replacement can actually accept the
+// pods evicted from the node we are about to drain.
+func (c *Client) WaitForNodeReady(ctx context.Context, instanceID string, timeout, poll time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	logged := false
+	for {
+		node, err := c.NodeForInstance(ctx, instanceID)
+		if err != nil {
+			return err
+		}
+		if node != nil {
+			if !logged {
+				c.logf("instance %s: replacement node %s joined; waiting for Ready", instanceID, node.Name)
+				logged = true
+			}
+			if nodeReady(node) && !node.Spec.Unschedulable {
+				c.logf("replacement node %s is Ready", node.Name)
+				return nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s waiting for replacement node of instance %s to become Ready", timeout, instanceID)
+		}
+		if err := sleep(ctx, poll); err != nil {
+			return err
+		}
+	}
+}
+
+func nodeReady(node *corev1.Node) bool {
+	for _, cond := range node.Status.Conditions {
+		if cond.Type == corev1.NodeReady {
+			return cond.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func sleep(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
 // CordonAndDrain cordons then drains the node using the official kubectl drain
 // helper (respects PDBs, evicts pods, filters DaemonSets).
 func (c *Client) CordonAndDrain(ctx context.Context, node *corev1.Node) error {
