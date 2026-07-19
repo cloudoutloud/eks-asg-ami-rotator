@@ -32,7 +32,7 @@ spec:
           operator: Exists
       containers:
         - name: controller
-          image: 986119050365.dkr.ecr.eu-west-2.amazonaws.com/images/asg-ami-rotater:v0.1.0
+          image: ACCOUNT_ID.dkr.ecr.eu-west-2.amazonaws.com/images/asg-ami-rotater:v0.2.0
           imagePullPolicy: IfNotPresent
           args:
             - --asg-names=$(ASG_NAMES)
@@ -45,7 +45,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             - name: ASG_NAMES
-              value: "eks-nodes-dev"
+              value: "your-asg-name"
             - name: AWS_REGION
               value: "eu-west-2"
           ports:

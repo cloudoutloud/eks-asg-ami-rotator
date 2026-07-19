@@ -147,8 +147,16 @@ func (r *Rotator) reconcileASG(ctx context.Context, name string) error {
 }
 
 // rollInstance performs the full lifecycle for a single stale instance:
-// standby (surge a replacement on the new AMI) then decommission the old one.
+// standby (surge a replacement on the new AMI), wait for that replacement to be
+// InService and Kubernetes-Ready, then decommission the old one.
 func (r *Rotator) rollInstance(ctx context.Context, asgName, instanceID string) error {
+	// Snapshot the InService instances so we can identify the replacement the
+	// ASG launches for the surge.
+	before, err := r.aws.InServiceInstanceIDs(ctx, asgName)
+	if err != nil {
+		return err
+	}
+
 	// Standby (no decrement) -> ASG launches a replacement on the new AMI.
 	r.logf("instance %s: entering standby (replacement will launch on new AMI)", instanceID)
 	if err := r.aws.EnterStandby(ctx, asgName, instanceID); err != nil {
@@ -157,6 +165,19 @@ func (r *Rotator) rollInstance(ctx context.Context, asgName, instanceID string) 
 	if err := r.aws.WaitForInstanceState(ctx, asgName, instanceID, "Standby", r.cfg.StabilizeTimeout, r.cfg.StabilizePoll, r.logf); err != nil {
 		return err
 	}
+
+	// Wait for the surge replacement to become InService+Healthy at the ASG
+	// level, then for its Kubernetes Node to actually join and report Ready.
+	// Only once the replacement can accept workloads do we drain the old node.
+	newID, err := r.aws.WaitForNewInService(ctx, asgName, before, r.cfg.StabilizeTimeout, r.cfg.StabilizePoll, r.logf)
+	if err != nil {
+		return err
+	}
+	r.logf("instance %s: replacement %s is InService; waiting for its node to be Ready", instanceID, newID)
+	if err := r.kube.WaitForNodeReady(ctx, newID, r.cfg.StabilizeTimeout, r.cfg.StabilizePoll); err != nil {
+		return err
+	}
+
 	return r.decommissionStandby(ctx, asgName, instanceID)
 }
 
@@ -165,6 +186,14 @@ func (r *Rotator) rollInstance(ctx context.Context, asgName, instanceID string) 
 // in Standby by an interrupted earlier roll (cordon/drain on an already-drained
 // node is a no-op).
 func (r *Rotator) decommissionStandby(ctx context.Context, asgName, instanceID string) error {
+	// Wait until the group is healthy (replacement in service) BEFORE draining,
+	// so the old node's pods have somewhere to land. This also guards the
+	// recovery path, where this method is called directly for an orphaned
+	// Standby instance.
+	if err := r.aws.WaitForStable(ctx, asgName, r.cfg.StabilizeTimeout, r.cfg.StabilizePoll, r.logf); err != nil {
+		return err
+	}
+
 	// Cordon + drain the node backing this instance.
 	node, err := r.kube.NodeForInstance(ctx, instanceID)
 	if err != nil {
@@ -176,11 +205,6 @@ func (r *Rotator) decommissionStandby(ctx context.Context, asgName, instanceID s
 		if err := r.kube.CordonAndDrain(ctx, node); err != nil {
 			return err
 		}
-	}
-
-	// Wait until the group is healthy (replacement in service).
-	if err := r.aws.WaitForStable(ctx, asgName, r.cfg.StabilizeTimeout, r.cfg.StabilizePoll, r.logf); err != nil {
-		return err
 	}
 
 	// Delete the Node object.
