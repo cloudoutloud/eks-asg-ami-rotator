@@ -1,6 +1,4 @@
-// Package awsclient wraps the AWS Auto Scaling, EC2 and SSM APIs used by the
-// rotator. The AMI-resolution and lifecycle logic mirrors the behaviour of the
-// rotate-asg-*.sh scripts this controller replaces.
+// Package awsclient wraps the AWS Auto Scaling, EC2 and SSM APIs used by the rotator.
 package awsclient
 
 import (

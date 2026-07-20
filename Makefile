@@ -5,17 +5,20 @@ IMAGE ?= ghcr.io/example/asg-ami-rotator:latest
 tidy:
 	go mod tidy
 
+# Build binary
 build:
 	CGO_ENABLED=0 go build -o bin/controller ./cmd/controller
 
 vet:
 	go vet ./...
 
-test:
-	go test ./...
+# Comment for now no tests
+# test:
+# 	go test ./...
 
+# Locally run binary
 run:
-	go run ./cmd/controller --asg-names=$(ASG_NAMES) --region=$(AWS_REGION) --leader-elect=false --dry-run
+	go run ./cmd/controller --asg-names=$(ASG_NAMES) --region=$(AWS_REGION) --leader-elect=false
 
 docker:
 	docker build -t $(IMAGE) .

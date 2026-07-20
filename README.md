@@ -75,8 +75,7 @@ Flags (each has an env fallback, shown in parentheses):
 | `--delete-emptydir-data` | `DELETE_EMPTYDIR_DATA` | `true` | Allow eviction of emptyDir pods. |
 | `--suspend-azrebalance` | `SUSPEND_AZREBALANCE` | `true` | Suspend AZRebalance during a roll. |
 | `--manage-max-size` | `MANAGE_MAX_SIZE` | `true` | Temporarily raise MaxSize for surge. |
-| `--dry-run` | `DRY_RUN` | `false` | Log actions without mutating anything. |
-| `--leader-elect` | `LEADER_ELECT` | `true` | Leader election (safe with >1 replica). |
+| `--leader-elect` | `LEADER_ELECT` | `true` | Leader election (safe with >1 replica). If more than one replica for HA only one pod will run controller loop to avoid clash |
 
 ## AWS permissions (IRSA)
 
@@ -94,16 +93,16 @@ create evictions, read workload controllers, and manage a leader-election lease.
 
 ## Build & deploy
 
-### Build and push the image (ECR)
+### Build and push the image to Amazon (ECR)
 
 First set the tag/image and log in to ECR:
 
 ```bash
 export TAG=v0.2.0
-export IMAGE=ACCOUNT_ID.dkr.ecr.eu-west-2.amazonaws.com/images/asg-ami-rotater:$TAG
+export IMAGE=ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/images/asg-ami-rotater:$TAG
 
-aws ecr get-login-password --region eu-west-2 \
-  | docker login --username AWS --password-stdin ACCOUNT_ID.dkr.ecr.eu-west-2.amazonaws.com
+aws ecr get-login-password --region REGION \
+  | docker login --username AWS --password-stdin ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com
 ```
 
 EKS nodes are typically `amd64` — swap `linux/amd64` for `linux/arm64` on
@@ -146,18 +145,13 @@ docker buildx build --platform linux/amd64 -t "$IMAGE" --load .
 docker push "$IMAGE"
 ```
 
-Optionally tag the matching git commit:
-
-```bash
-git tag -a "$TAG" -m "$TAG" && git push origin "$TAG"
-```
-
 ### Deploy
 
 ```bash
 make tidy          # resolve go.sum
 make build         # build the binary locally (optional)
 # edit deploy/*.yaml: image, ASG_NAMES, AWS_REGION, IRSA role ARN
+# apply k8s manifests
 make deploy
 ```
 
@@ -167,11 +161,11 @@ Or roll out a new tag against a running deployment:
 kubectl -n <namespace> set image deployment/asg-ami-rotator controller="$IMAGE"
 ```
 
-## Local dry-run (Optional)
+## Local run (optional)
 
 ```bash
-make run ASG_NAMES=my-bootstrap-asg AWS_REGION=eu-west-2
+make run ASG_NAMES=my-bootstrap-asg AWS_REGION=REGION
 ```
 
-This uses your local kubeconfig and AWS credentials, disables leader election,
-and only logs what it *would* do.
+This uses your local kubeconfig and AWS credentials and disables leader
+election. **It will mutate AWS and Kubernetes** — use a dev cluster/ASG only.

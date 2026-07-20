@@ -40,9 +40,6 @@ type Config struct {
 	// ManageMaxSize temporarily raises MaxSize to allow the surge instance.
 	ManageMaxSize bool
 
-	// DryRun logs intended actions without mutating anything.
-	DryRun bool
-
 	// Leader election / probes.
 	EnableLeaderElection bool
 	LeaderElectionID     string
@@ -88,9 +85,6 @@ func Load(args []string) (*Config, error) {
 		"Suspend the AZRebalance process during a roll.")
 	fs.BoolVar(&c.ManageMaxSize, "manage-max-size", envBool("MANAGE_MAX_SIZE", true),
 		"Temporarily raise MaxSize to allow the surge instance during a roll.")
-
-	fs.BoolVar(&c.DryRun, "dry-run", envBool("DRY_RUN", false),
-		"Log intended actions without mutating AWS or Kubernetes.")
 
 	fs.BoolVar(&c.EnableLeaderElection, "leader-elect", envBool("LEADER_ELECT", true),
 		"Enable leader election so only one replica acts at a time.")
