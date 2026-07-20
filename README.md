@@ -4,9 +4,11 @@ A Kubernetes controller that keeps a set of EC2 Auto Scaling Groups (ASGs)
 rolled onto their current AMI, one node at a time, draining each node gracefully
 through the Kubernetes API.
 
+This is intended to be used with Amazon EKS https://docs.aws.amazon.com/eks/latest/userguide/what-is-eks.html
+
 ## What is solves
 
-Karpenter manages most of the fleet, but some **bootstrap** nodes still live in
+Karpenter may manage most of the fleet, but some **bootstrap** nodes still live in
 a plain ASG (for example, the nodes Karpenter itself needs before it can act).
 When that ASG's launch template points at a new AMI, those nodes must be rolled
 without an outage. This controller does that continuously and unattended.
@@ -14,6 +16,8 @@ without an outage. This controller does that continuously and unattended.
 It **runs on Karpenter on-demand nodes** (via a `nodeSelector`) precisely because
 it manages the ASG bootstrap nodes — it must not be scheduled onto a node it is
 about to drain.
+
+This is useful if your team build there own AMI for EKS worker nodes.
 
 ## What it does
 
