@@ -4,9 +4,11 @@ A Kubernetes controller that keeps a set of EC2 Auto Scaling Groups (ASGs)
 rolled onto their current AMI, one node at a time, draining each node gracefully
 through the Kubernetes API.
 
-## Why
+This is intended to be used with Amazon EKS https://docs.aws.amazon.com/eks/latest/userguide/what-is-eks.html
 
-Karpenter manages most of the fleet, but some **bootstrap** nodes still live in
+## What is solves
+
+Karpenter may manage most of the fleet, but some **bootstrap** nodes still live in
 a plain ASG (for example, the nodes Karpenter itself needs before it can act).
 When that ASG's launch template points at a new AMI, those nodes must be rolled
 without an outage. This controller does that continuously and unattended.
@@ -14,6 +16,8 @@ without an outage. This controller does that continuously and unattended.
 It **runs on Karpenter on-demand nodes** (via a `nodeSelector`) precisely because
 it manages the ASG bootstrap nodes — it must not be scheduled onto a node it is
 about to drain.
+
+This is useful if your team build there own AMI for EKS worker nodes.
 
 ## What it does
 
@@ -47,6 +51,57 @@ On a timer, for each managed ASG:
 Instance → Node mapping is done via the node's `spec.providerID`
 (`aws:///<az>/<instance-id>`).
 
+## How AMI detection works
+
+The controller does not watch for AMI release events. On each reconcile it
+compares **two AMI IDs**:
+
+| | Source |
+|---|--------|
+| **Target AMI** | What the ASG would launch *today* (from its launch template / launch configuration) |
+| **Actual AMI** | What each `InService` instance is running (from EC2 `DescribeInstances`) |
+
+If **actual ≠ target**, that instance is stale and gets rolled one at a time.
+If every `InService` instance already matches the target, it does nothing.
+
+Updating the launch template (or the value behind an SSM alias) is what triggers
+a roll — the controller simply notices the ID mismatch on the next poll.
+
+### Resolving the target AMI
+
+The launch template `imageId` can be set in two common ways:
+
+**Direct AMI ID** (typical for custom AMIs you build):
+
+```text
+imageId: ami-0abc123def4567890
+```
+
+The controller uses that ID as-is. When you publish a new custom AMI, update the
+launch template to the new `ami-...` and the controller rolls instances still on
+the old ID.
+
+**SSM alias** (typical for official EKS optimized AMIs):
+
+```text
+imageId: resolve:ssm:/aws/service/eks/optimized-ami/1.34/amazon-linux-2023/x86_64/standard/recommended/image_id
+```
+
+- **`resolve:ssm:`** — AWS/EKS convention meaning “look up the AMI ID from SSM
+  Parameter Store, not a literal string.”
+- **SSM** — **AWS Systems Manager**; specifically **Parameter Store**, a
+  key/value config service.
+- The path after the prefix is the parameter name; its **value** is the current
+  `ami-...` (AWS updates this when a new recommended EKS AMI is published).
+
+The controller strips `resolve:ssm:`, calls `ssm:GetParameter`, and uses the
+returned AMI ID as the target. IAM must allow `ssm:GetParameter` on those paths
+(see [`deploy/iam-policy.json`](deploy/iam-policy.json)).
+
+You can also point `resolve:ssm:` at your own parameter (e.g.
+`/my-company/eks-node-ami/latest`) if you maintain a custom AMI ID there —
+same lookup mechanism.
+
 ## Notes & safety
 
 - **One instance at a time**, and each step waits for the ASG to be healthy
@@ -58,12 +113,44 @@ Instance → Node mapping is done via the node's `spec.providerID`
 
 ## Configuration
 
+### Required
+
+The controller **refuses to start** unless you provide **one** of these ASG
+selection options (enforced in `config.validate()`):
+
+| Option | Flag / env | Example |
+|--------|------------|---------|
+| **Explicit ASG names** | `--asg-names` or `ASG_NAMES` | `ASG_NAMES=eks-nodes-dev,eks-nodes-prod` |
+| **Tag discovery** | `--asg-tag-key` + `--asg-tag-value` (or `ASG_TAG_KEY` + `ASG_TAG_VALUE`) | `ASG_TAG_KEY=ami-rotator` and `ASG_TAG_VALUE=managed` |
+
+You must supply **either** a non-empty ASG name list **or** **both** tag key and
+value. Tag discovery is only used when `--asg-names` / `ASG_NAMES` is empty.
+
+Everything else in the table below is **optional** and has a default. The only
+other validated setting is `--poll-interval` / `POLL_INTERVAL`, which must be
+positive (default `60s` satisfies this).
+
+**Recommended in production** (not enforced by the binary, but required for a
+working in-cluster deploy):
+
+| Setting | Where | Why |
+|---------|--------|-----|
+| `AWS_REGION` / `--region` | Deployment env or args | Avoid ambiguous region with IRSA; must match the ASG |
+| `POD_NAMESPACE` | Deployment env (downward API) | Leader-election lease namespace; set in [`deploy/deployment.yaml`](deploy/deployment.yaml) |
+| IRSA role ARN | ServiceAccount annotation in [`deploy/rbac.yaml`](deploy/rbac.yaml) | AWS API access |
+| Container image | Deployment | Which controller version to run |
+
+There is **no** controller flag for target AMI — that comes from the ASG launch
+template in AWS (see [How AMI detection works](#how-ami-detection-works)).
+
+### All flags
+
 Flags (each has an env fallback, shown in parentheses):
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
-| `--asg-names` | `ASG_NAMES` | – | Comma-separated ASG names to manage. |
-| `--asg-tag-key` / `--asg-tag-value` | `ASG_TAG_KEY` / `ASG_TAG_VALUE` | – | Discover ASGs by tag when `--asg-names` is empty. |
+| `--asg-names` | `ASG_NAMES` | – | Comma-separated ASG names to manage. **Required** unless using tag discovery. |
+| `--asg-tag-key` / `--asg-tag-value` | `ASG_TAG_KEY` / `ASG_TAG_VALUE` | – | Discover ASGs by tag when `--asg-names` is empty. **Both required** if used instead of names. |
 | `--region` | `AWS_REGION` | SDK default | AWS region. |
 | `--poll-interval` | `POLL_INTERVAL` | `60s` | Reconcile cadence. |
 | `--stabilize-timeout` | `STABILIZE_TIMEOUT` | `20m` | Max wait for the ASG to become healthy. |
@@ -75,8 +162,7 @@ Flags (each has an env fallback, shown in parentheses):
 | `--delete-emptydir-data` | `DELETE_EMPTYDIR_DATA` | `true` | Allow eviction of emptyDir pods. |
 | `--suspend-azrebalance` | `SUSPEND_AZREBALANCE` | `true` | Suspend AZRebalance during a roll. |
 | `--manage-max-size` | `MANAGE_MAX_SIZE` | `true` | Temporarily raise MaxSize for surge. |
-| `--dry-run` | `DRY_RUN` | `false` | Log actions without mutating anything. |
-| `--leader-elect` | `LEADER_ELECT` | `true` | Leader election (safe with >1 replica). |
+| `--leader-elect` | `LEADER_ELECT` | `true` | Leader election (safe with >1 replica). If more than one replica for HA only one pod will run controller loop to avoid clash |
 
 ## AWS permissions (IRSA)
 
@@ -94,16 +180,16 @@ create evictions, read workload controllers, and manage a leader-election lease.
 
 ## Build & deploy
 
-### Build and push the image (ECR)
+### Build and push the image to Amazon (ECR)
 
 First set the tag/image and log in to ECR:
 
 ```bash
 export TAG=v0.2.0
-export IMAGE=ACCOUNT_ID.dkr.ecr.eu-west-2.amazonaws.com/images/asg-ami-rotater:$TAG
+export IMAGE=ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/images/asg-ami-rotater:$TAG
 
-aws ecr get-login-password --region eu-west-2 \
-  | docker login --username AWS --password-stdin ACCOUNT_ID.dkr.ecr.eu-west-2.amazonaws.com
+aws ecr get-login-password --region REGION \
+  | docker login --username AWS --password-stdin ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com
 ```
 
 EKS nodes are typically `amd64` — swap `linux/amd64` for `linux/arm64` on
@@ -146,18 +232,13 @@ docker buildx build --platform linux/amd64 -t "$IMAGE" --load .
 docker push "$IMAGE"
 ```
 
-Optionally tag the matching git commit:
-
-```bash
-git tag -a "$TAG" -m "$TAG" && git push origin "$TAG"
-```
-
 ### Deploy
 
 ```bash
 make tidy          # resolve go.sum
 make build         # build the binary locally (optional)
 # edit deploy/*.yaml: image, ASG_NAMES, AWS_REGION, IRSA role ARN
+# apply k8s manifests
 make deploy
 ```
 
@@ -166,12 +247,3 @@ Or roll out a new tag against a running deployment:
 ```bash
 kubectl -n <namespace> set image deployment/asg-ami-rotator controller="$IMAGE"
 ```
-
-## Local dry-run (Optional)
-
-```bash
-make run ASG_NAMES=my-bootstrap-asg AWS_REGION=eu-west-2
-```
-
-This uses your local kubeconfig and AWS credentials, disables leader election,
-and only logs what it *would* do.

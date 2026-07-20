@@ -83,7 +83,7 @@ func run() error {
 
 	// The poll loop only runs on the elected leader.
 	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-		logf("starting rotator: interval=%s dry-run=%t", cfg.PollInterval, cfg.DryRun)
+		logf("starting rotator: interval=%s", cfg.PollInterval)
 		ticker := time.NewTicker(cfg.PollInterval)
 		defer ticker.Stop()
 		// Run once immediately, then on each tick.

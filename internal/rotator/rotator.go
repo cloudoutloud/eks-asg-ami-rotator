@@ -1,5 +1,6 @@
 // Package rotator orchestrates rolling an ASG's instances onto the current AMI:
-// standby -> cordon/drain -> (healthy) -> delete node -> detach -> terminate.
+// standby -> replacement InService -> replacement Ready -> cordon/drain ->
+// delete node -> terminate (via ASG, no decrement).
 package rotator
 
 import (
@@ -97,12 +98,6 @@ func (r *Rotator) reconcileASG(ctx context.Context, name string) error {
 	}
 	if len(stale) > 0 {
 		r.logf("asg %s: target AMI %s; %d stale instance(s) to roll: %v", name, targetAMI, len(stale), stale)
-	}
-
-	if r.cfg.DryRun {
-		r.logf("[DRY-RUN] asg %s: would recover %d Standby and roll %d stale instance(s) one at a time",
-			name, len(standby), len(stale))
-		return nil
 	}
 
 	// Prepare the group for the roll (surge headroom + suspend rebalancing) and
