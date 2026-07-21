@@ -58,14 +58,20 @@ compares **two AMI IDs**:
 
 | | Source |
 |---|--------|
-| **Target AMI** | What the ASG would launch *today* (from its launch template / launch configuration) |
-| **Actual AMI** | What each `InService` instance is running (from EC2 `DescribeInstances`) |
+| **Target AMI** | Launch template / launch configuration on the ASG, **or** `--ami-id-override` / `AMI_ID_OVERRIDE` when set |
+| **Actual AMI** | Each `InService` instance's AMI (from EC2 `DescribeInstances`) |
 
 If **actual ≠ target**, that instance is stale and gets rolled one at a time.
 If every `InService` instance already matches the target, it does nothing.
 
 Updating the launch template (or the value behind an SSM alias) is what triggers
 a roll — the controller simply notices the ID mismatch on the next poll.
+
+Alternatively, set **`--ami-id-override`** / **`AMI_ID_OVERRIDE`** to pin a
+specific `ami-...` as the target for all managed ASGs (skips launch-template
+resolution). The ASG launch template must still launch **new** instances with that
+same AMI ID, or surge replacements will never match the override and the roll
+will not complete.
 
 ### Resolving the target AMI
 
@@ -140,8 +146,9 @@ working in-cluster deploy):
 | IRSA role ARN | ServiceAccount annotation in [`deploy/rbac.yaml`](deploy/rbac.yaml) | AWS API access |
 | Container image | Deployment | Which controller version to run |
 
-There is **no** controller flag for target AMI — that comes from the ASG launch
-template in AWS (see [How AMI detection works](#how-ami-detection-works)).
+By default the target AMI comes from the ASG launch template in AWS (see
+[How AMI detection works](#how-ami-detection-works)). Optionally pin it with
+`--ami-id-override` / `AMI_ID_OVERRIDE` instead.
 
 ### All flags
 
@@ -151,6 +158,7 @@ Flags (each has an env fallback, shown in parentheses):
 |------|-----|---------|-------------|
 | `--asg-names` | `ASG_NAMES` | – | Comma-separated ASG names to manage. **Required** unless using tag discovery. |
 | `--asg-tag-key` / `--asg-tag-value` | `ASG_TAG_KEY` / `ASG_TAG_VALUE` | – | Discover ASGs by tag when `--asg-names` is empty. **Both required** if used instead of names. |
+| `--ami-id-override` | `AMI_ID_OVERRIDE` | – | Pin target AMI ID (`ami-...`); skips launch-template/SSM resolution. Launch template must still launch this AMI. |
 | `--region` | `AWS_REGION` | SDK default | AWS region. |
 | `--poll-interval` | `POLL_INTERVAL` | `60s` | Reconcile cadence. |
 | `--stabilize-timeout` | `STABILIZE_TIMEOUT` | `20m` | Max wait for the ASG to become healthy. |

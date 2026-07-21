@@ -52,8 +52,16 @@ func (r *Rotator) ReconcileAll(ctx context.Context) error {
 	return nil
 }
 
+func (r *Rotator) resolveTargetAMI(ctx context.Context, asgName string) (string, error) {
+	if r.cfg.AMIIDOverride != "" {
+		r.logf("asg %s: using AMI ID override %s (skipping launch-template resolution)", asgName, r.cfg.AMIIDOverride)
+		return r.cfg.AMIIDOverride, nil
+	}
+	return r.aws.ResolveTargetAMI(ctx, asgName)
+}
+
 func (r *Rotator) reconcileASG(ctx context.Context, name string) error {
-	targetAMI, err := r.aws.ResolveTargetAMI(ctx, name)
+	targetAMI, err := r.resolveTargetAMI(ctx, name)
 	if err != nil {
 		return err
 	}

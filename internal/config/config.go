@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 )
-
 // Config is the fully-resolved controller configuration.
 type Config struct {
 	// ASGNames is the explicit list of Auto Scaling Groups to manage.
@@ -20,6 +19,12 @@ type Config struct {
 
 	// Region is the AWS region. Empty means the SDK default chain decides.
 	Region string
+
+	// AMIIDOverride, when set, is the target AMI ID to roll onto instead of
+	// resolving from the ASG launch template. The launch template must still
+	// launch new instances with this AMI or replacements will not become healthy
+	// relative to the override.
+	AMIIDOverride string
 
 	// PollInterval is how often the reconcile loop runs.
 	PollInterval time.Duration
@@ -62,6 +67,8 @@ func Load(args []string) (*Config, error) {
 		"Tag value to match together with --asg-tag-key.")
 	fs.StringVar(&c.Region, "region", env("AWS_REGION", ""),
 		"AWS region (defaults to the SDK credential/region chain).")
+	fs.StringVar(&c.AMIIDOverride, "ami-id-override", env("AMI_ID_OVERRIDE", ""),
+		"Target AMI ID to roll onto (ami-...). When set, skips launch-template/SSM resolution.")
 
 	fs.DurationVar(&c.PollInterval, "poll-interval", envDuration("POLL_INTERVAL", 60*time.Second),
 		"How often to reconcile the managed ASGs.")
@@ -117,6 +124,12 @@ func (c *Config) validate() error {
 	}
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("--poll-interval must be positive")
+	}
+	if o := strings.TrimSpace(c.AMIIDOverride); o != "" {
+		if !strings.HasPrefix(o, "ami-") {
+			return fmt.Errorf("--ami-id-override must be a valid AMI ID (ami-...)")
+		}
+		c.AMIIDOverride = o
 	}
 	return nil
 }
