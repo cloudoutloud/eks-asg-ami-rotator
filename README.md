@@ -45,8 +45,8 @@ On a timer, for each managed ASG:
    5. **Terminate** the old instance through the ASG with
       `TerminateInstanceInAutoScalingGroup` **without decrementing desired**, so
       the healthy replacement is not scaled back down.
-6. Restore `MaxSize` and resume `AZRebalance` (safe, because every instance is
-   fully terminated before this runs).
+6. Restore `MaxSize` (once no instances remain in `Standby`) and resume
+   `AZRebalance`.
 
 Instance → Node mapping is done via the node's `spec.providerID`
 (`aws:///<az>/<instance-id>`).
@@ -106,8 +106,10 @@ same lookup mechanism.
 
 - **One instance at a time**, and each step waits for the ASG to be healthy
   before proceeding — a failed drain or unhealthy replacement halts the roll.
-- Cleanup (restore `MaxSize`, resume `AZRebalance`) runs even if the process is
-  cancelled mid-roll.
+- Cleanup (resume `AZRebalance`) runs even if the process is cancelled mid-roll.
+  **`MaxSize` is only restored once the roll has settled** (no instances left in
+  `Standby`), so a failed or interrupted roll keeps surge headroom for the next
+  pass.
 - Because it drains via the Kube API directly, it does **not** require
   aws-node-termination-handler or ASG lifecycle hooks.
 
