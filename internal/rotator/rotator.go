@@ -88,8 +88,14 @@ func (r *Rotator) reconcileASG(ctx context.Context, name string) error {
 		}
 	}
 
+	maxRestoreTarget := r.maxRestoreTarget(gs)
+
 	if len(standby) == 0 && len(stale) == 0 {
 		r.logf("asg %s: all InService instances already on target AMI %s; no Standby to recover", name, targetAMI)
+		// A prior interrupted roll may have left MaxSize at Desired+1 even though
+		// the group is now fully rolled and settled. restoreMaxSizeWhenSettled
+		// is a no-op when MaxSize is already at target.
+		r.restoreMaxSizeWhenSettled(ctx, name, maxRestoreTarget)
 		return nil
 	}
 
@@ -100,14 +106,16 @@ func (r *Rotator) reconcileASG(ctx context.Context, name string) error {
 		r.logf("asg %s: target AMI %s; %d stale instance(s) to roll: %v", name, targetAMI, len(stale), stale)
 	}
 
-	// Prepare the group for the roll (surge headroom + suspend rebalancing) and
-	// arrange to restore it afterwards. Because every instance is fully
-	// decommissioned (terminated) before this returns, restoring MaxSize is safe.
+	// Prepare the group for the roll (surge headroom + suspend rebalancing).
+	// MaxSize is restored only once the roll has settled (no Standby left).
 	restore, err := r.prepareGroup(ctx, gs)
 	if err != nil {
 		return err
 	}
-	defer restore()
+	defer func() {
+		restore()
+		r.restoreMaxSizeWhenSettled(context.Background(), name, maxRestoreTarget)
+	}()
 
 	// Do not wait for full stability before recovering orphaned Standby
 	// instances: a prior interrupted roll can leave healthy_inservice <
@@ -277,11 +285,58 @@ func (r *Rotator) prepareGroup(ctx context.Context, gs *awsclient.GroupState) (f
 				r.logf("asg %s: WARN failed to resume AZRebalance: %v", name, err)
 			}
 		}
-		if bumped {
-			r.logf("asg %s: restoring MaxSize -> %d", name, origMax)
-			if err := r.aws.SetMaxSize(cctx, name, origMax); err != nil {
-				r.logf("asg %s: WARN failed to restore MaxSize: %v", name, err)
-			}
-		}
 	}, nil
+}
+
+// maxRestoreTarget returns the MaxSize to restore after a settled roll, or -1 if
+// ManageMaxSize is off or the current MaxSize was not raised (or left raised)
+// for surge headroom.
+func (r *Rotator) maxRestoreTarget(gs *awsclient.GroupState) int32 {
+	if !r.cfg.ManageMaxSize {
+		return -1
+	}
+	surge := gs.DesiredCapacity + 1
+	switch {
+	case gs.MaxSize < surge:
+		return gs.MaxSize
+	case gs.MaxSize == surge:
+		// Likely still at the temporary surge ceiling from an earlier pass.
+		return gs.DesiredCapacity
+	default:
+		return -1
+	}
+}
+
+// restoreMaxSizeWhenSettled lowers MaxSize back to target once no instances
+// remain in Standby. If the roll is still in progress (Standby present), it
+// skips restoration so the surge replacement keeps its headroom.
+func (r *Rotator) restoreMaxSizeWhenSettled(ctx context.Context, name string, target int32) {
+	if target < 0 {
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	gs, err := r.aws.DescribeGroup(cctx, name)
+	if err != nil {
+		r.logf("asg %s: WARN failed to describe ASG before restoring MaxSize: %v", name, err)
+		return
+	}
+	var standbyCount int
+	for _, in := range gs.Instances {
+		if in.LifecycleState == "Standby" {
+			standbyCount++
+		}
+	}
+	if standbyCount > 0 {
+		r.logf("asg %s: deferring MaxSize restore -> %d (%d instance(s) still in Standby)", name, target, standbyCount)
+		return
+	}
+	if gs.MaxSize <= target {
+		return
+	}
+	r.logf("asg %s: restoring MaxSize %d -> %d", name, gs.MaxSize, target)
+	if err := r.aws.SetMaxSize(cctx, name, target); err != nil {
+		r.logf("asg %s: WARN failed to restore MaxSize: %v", name, err)
+	}
 }
