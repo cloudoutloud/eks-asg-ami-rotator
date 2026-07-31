@@ -109,9 +109,16 @@ func (r *Rotator) reconcileASG(ctx context.Context, name string) error {
 	}
 	defer restore()
 
-	// Ensure a healthy starting point before touching anything.
-	if err := r.aws.WaitForStable(ctx, name, r.cfg.StabilizeTimeout, r.cfg.StabilizePoll, r.logf); err != nil {
-		return err
+	// Do not wait for full stability before recovering orphaned Standby
+	// instances: a prior interrupted roll can leave healthy_inservice <
+	// desired until the replacement finishes launching (or until we
+	// decommission the Standby node). decommissionStandby waits for a healthy
+	// replacement before draining.
+	// Only run WaitForStable if there are no standby instances
+	if len(standby) == 0 {
+		if err := r.aws.WaitForStable(ctx, name, r.cfg.StabilizeTimeout, r.cfg.StabilizePoll, r.logf); err != nil {
+			return err
+		}
 	}
 
 	// 1) Finish recovering any pre-existing Standby instances.
@@ -126,6 +133,11 @@ func (r *Rotator) reconcileASG(ctx context.Context, name string) error {
 	}
 
 	// 2) Roll the stale InService instances.
+	if len(stale) > 0 {
+		if err := r.aws.WaitForStable(ctx, name, r.cfg.StabilizeTimeout, r.cfg.StabilizePoll, r.logf); err != nil {
+			return err
+		}
+	}
 	for i, id := range stale {
 		if ctx.Err() != nil {
 			return ctx.Err()
