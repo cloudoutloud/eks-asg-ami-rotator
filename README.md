@@ -117,16 +117,12 @@ same lookup mechanism.
 
 ### Required
 
-The controller **refuses to start** unless you provide **one** of these ASG
-selection options (enforced in `config.validate()`):
+The controller **refuses to start** unless `--asg-names` / `ASG_NAMES` is set
+(enforced in `config.validate()`):
 
 | Option | Flag / env | Example |
 |--------|------------|---------|
 | **Explicit ASG names** | `--asg-names` or `ASG_NAMES` | `ASG_NAMES=eks-nodes-dev,eks-nodes-prod` |
-| **Tag discovery** | `--asg-tag-key` + `--asg-tag-value` (or `ASG_TAG_KEY` + `ASG_TAG_VALUE`) | `ASG_TAG_KEY=ami-rotator` and `ASG_TAG_VALUE=managed` |
-
-You must supply **either** a non-empty ASG name list **or** **both** tag key and
-value. Tag discovery is only used when `--asg-names` / `ASG_NAMES` is empty.
 
 Everything else in the table below is **optional** and has a default. The only
 other validated setting is `--poll-interval` / `POLL_INTERVAL`, which must be
@@ -151,8 +147,7 @@ Flags (each has an env fallback, shown in parentheses):
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
-| `--asg-names` | `ASG_NAMES` | – | Comma-separated ASG names to manage. **Required** unless using tag discovery. |
-| `--asg-tag-key` / `--asg-tag-value` | `ASG_TAG_KEY` / `ASG_TAG_VALUE` | – | Discover ASGs by tag when `--asg-names` is empty. **Both required** if used instead of names. |
+| `--asg-names` | `ASG_NAMES` | – | Comma-separated ASG names to manage. **Required.** |
 | `--region` | `AWS_REGION` | SDK default | AWS region. |
 | `--poll-interval` | `POLL_INTERVAL` | `60s` | Reconcile cadence. |
 | `--stabilize-timeout` | `STABILIZE_TIMEOUT` | `20m` | Max wait for the ASG to become healthy. |
