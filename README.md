@@ -159,7 +159,39 @@ Flags (each has an env fallback, shown in parentheses):
 | `--delete-emptydir-data` | `DELETE_EMPTYDIR_DATA` | `true` | Allow eviction of emptyDir pods. |
 | `--suspend-azrebalance` | `SUSPEND_AZREBALANCE` | `true` | Suspend AZRebalance during a roll. |
 | `--manage-max-size` | `MANAGE_MAX_SIZE` | `true` | Temporarily raise MaxSize for surge. |
+| `--batch-mode` | `BATCH_MODE` | `false` | Roll in waves instead of one node at a time. |
+| `--batch-size` | `BATCH_SIZE` | `5` | Batch mode: how many Standby instances to drain together per wave. |
+| `--batch-max-surge` | `BATCH_MAX_SURGE` | `10` | Batch mode: max instances moved into Standby at once (`0` = one wave for all stale). |
+| `--batch-terminate-last` | `BATCH_TERMINATE_LAST` | `false` | Batch mode: delete nodes and terminate instances once after all waves are drained. |
 | `--leader-elect` | `LEADER_ELECT` | `true` | Leader election (safe with >1 replica). If more than one replica for HA only one pod will run controller loop to avoid clash |
+
+### Batch mode
+
+With `--batch-mode=true`, the controller surges up to `--batch-max-surge` stale
+instances into Standby at once, waits for their replacements to join and report
+Ready, then drains them in groups of `--batch-size`. This pays the node-boot
+wait once per wave instead of once per instance.
+
+**Termination timing** is controlled by `--batch-terminate-last`:
+
+| Setting | Behavior | Peak `MaxSize` |
+|---------|----------|----------------|
+| `false` (default) | Surge → drain → terminate **each wave** before the next surges | `Desired + batch-max-surge` |
+| `true` | Surge and drain all waves, then **one** node delete and instance terminate at the end | `Desired + full roll size` |
+
+Use `--batch-terminate-last=true` when terminate waits dominate wall clock and
+you have headroom for every replaced instance to sit in Standby until the roll
+finishes draining. Keep the default when you want lower peak capacity during the
+roll.
+
+Example deployment args:
+
+```yaml
+- --batch-mode=true
+- --batch-size=2
+- --batch-max-surge=3
+- --batch-terminate-last=true
+```
 
 ## AWS permissions (IRSA)
 
