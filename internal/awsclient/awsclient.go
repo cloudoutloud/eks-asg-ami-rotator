@@ -4,6 +4,7 @@ package awsclient
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -54,27 +55,6 @@ func New(ctx context.Context, region string) (*Client, error) {
 		ec2: ec2.NewFromConfig(cfg),
 		ssm: ssm.NewFromConfig(cfg),
 	}, nil
-}
-
-// DiscoverByTag returns ASG names carrying the given tag key/value.
-func (c *Client) DiscoverByTag(ctx context.Context, key, value string) ([]string, error) {
-	var names []string
-	p := autoscaling.NewDescribeAutoScalingGroupsPaginator(c.asg, &autoscaling.DescribeAutoScalingGroupsInput{
-		Filters: []asgtypes.Filter{
-			{Name: aws.String("tag-key"), Values: []string{key}},
-			{Name: aws.String("tag-value"), Values: []string{value}},
-		},
-	})
-	for p.HasMorePages() {
-		out, err := p.NextPage(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("discover asgs by tag: %w", err)
-		}
-		for _, g := range out.AutoScalingGroups {
-			names = append(names, aws.ToString(g.AutoScalingGroupName))
-		}
-	}
-	return names, nil
 }
 
 // DescribeGroup returns a snapshot of the named ASG.
@@ -262,6 +242,49 @@ func (c *Client) WaitForNewInService(ctx context.Context, name string, known []s
 	}
 }
 
+// WaitForNewInServiceCount blocks until at least count InService+Healthy
+// instances outside the known set have appeared, returning their IDs. This is
+// how a batched roll identifies the replacements the ASG launches for a whole
+// wave of instances moved into Standby.
+func (c *Client) WaitForNewInServiceCount(ctx context.Context, name string, known []string, count int, timeout, poll time.Duration, log func(string, ...any)) ([]string, error) {
+	if count <= 0 {
+		return nil, nil
+	}
+	knownSet := make(map[string]struct{}, len(known))
+	for _, id := range known {
+		knownSet[id] = struct{}{}
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		gs, err := c.DescribeGroup(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		var found []string
+		for _, in := range gs.Instances {
+			if in.LifecycleState != "InService" || in.HealthStatus != "Healthy" {
+				continue
+			}
+			if _, ok := knownSet[in.ID]; !ok {
+				found = append(found, in.ID)
+			}
+		}
+		if len(found) >= count {
+			sort.Strings(found)
+			return found, nil
+		}
+		if log != nil {
+			log("asg %s: %d/%d replacement(s) InService+Healthy", name, len(found), count)
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out after %s waiting for %d replacement instance(s) in asg %q (saw %d)", timeout, count, name, len(found))
+		}
+		if err := sleep(ctx, poll); err != nil {
+			return nil, err
+		}
+	}
+}
+
 // EnterStandby moves an instance to Standby without decrementing desired
 // capacity, so the ASG launches a replacement on the current AMI.
 func (c *Client) EnterStandby(ctx context.Context, asgName, instanceID string) error {
@@ -272,6 +295,32 @@ func (c *Client) EnterStandby(ctx context.Context, asgName, instanceID string) e
 	})
 	if err != nil {
 		return fmt.Errorf("enter-standby %s: %w", instanceID, err)
+	}
+	return nil
+}
+
+// enterStandbyChunk bounds how many instance IDs go into one EnterStandby call.
+// The API documents a maximum of 20 per request and rejects more with a
+// (non-retryable) validation error, so callers are chunked rather than retried.
+const enterStandbyChunk = 20
+
+// EnterStandbyMany moves several instances to Standby in one go, again without
+// decrementing desired capacity, so the ASG launches a replacement for each.
+func (c *Client) EnterStandbyMany(ctx context.Context, asgName string, instanceIDs []string) error {
+	for start := 0; start < len(instanceIDs); start += enterStandbyChunk {
+		end := start + enterStandbyChunk
+		if end > len(instanceIDs) {
+			end = len(instanceIDs)
+		}
+		chunk := instanceIDs[start:end]
+		_, err := c.asg.EnterStandby(ctx, &autoscaling.EnterStandbyInput{
+			AutoScalingGroupName:           aws.String(asgName),
+			InstanceIds:                    chunk,
+			ShouldDecrementDesiredCapacity: aws.Bool(false),
+		})
+		if err != nil {
+			return fmt.Errorf("enter-standby %s: %w", strings.Join(chunk, ","), err)
+		}
 	}
 	return nil
 }
@@ -386,6 +435,50 @@ func (c *Client) WaitForInstanceState(ctx context.Context, name, instanceID, wan
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timed out waiting for instance %s to reach %s", instanceID, wantState)
+		}
+		if err := sleep(ctx, poll); err != nil {
+			return err
+		}
+	}
+}
+
+// WaitForInstancesState blocks until every listed instance reaches wantState
+// (use "Gone" for instances that should have left the ASG), or the timeout
+// elapses.
+func (c *Client) WaitForInstancesState(ctx context.Context, name string, instanceIDs []string, wantState string, timeout, poll time.Duration, log func(string, ...any)) error {
+	if len(instanceIDs) == 0 {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		gs, err := c.DescribeGroup(ctx, name)
+		if err != nil {
+			return err
+		}
+		states := make(map[string]string, len(instanceIDs))
+		for _, id := range instanceIDs {
+			states[id] = "Gone"
+		}
+		for _, in := range gs.Instances {
+			if _, tracked := states[in.ID]; tracked {
+				states[in.ID] = in.LifecycleState
+			}
+		}
+		var pending []string
+		for _, id := range instanceIDs {
+			if states[id] != wantState {
+				pending = append(pending, fmt.Sprintf("%s=%s", id, states[id]))
+			}
+		}
+		if len(pending) == 0 {
+			return nil
+		}
+		if log != nil {
+			log("asg %s: waiting for %d instance(s) to reach %s: %s", name, len(pending), wantState, strings.Join(pending, " "))
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s waiting for instances in asg %q to reach %s: %s",
+				timeout, name, wantState, strings.Join(pending, " "))
 		}
 		if err := sleep(ctx, poll); err != nil {
 			return err

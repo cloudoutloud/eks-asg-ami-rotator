@@ -69,6 +69,68 @@ func (c *Client) NodeForInstance(ctx context.Context, instanceID string) (*corev
 	return nil, nil
 }
 
+// NodesForInstances maps each instance ID to its Node using a single List call,
+// which matters when a batched roll needs nodes for many instances at once.
+// Instances with no matching Node are absent from the result.
+func (c *Client) NodesForInstances(ctx context.Context, instanceIDs []string) (map[string]*corev1.Node, error) {
+	result := make(map[string]*corev1.Node, len(instanceIDs))
+	if len(instanceIDs) == 0 {
+		return result, nil
+	}
+	nodes, err := c.cs.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list nodes: %w", err)
+	}
+	byInstance := make(map[string]*corev1.Node, len(nodes.Items))
+	for i := range nodes.Items {
+		n := &nodes.Items[i]
+		if idx := strings.LastIndex(n.Spec.ProviderID, "/"); idx >= 0 {
+			byInstance[n.Spec.ProviderID[idx+1:]] = n
+		}
+	}
+	for _, id := range instanceIDs {
+		if n, ok := byInstance[id]; ok {
+			result[id] = n
+		}
+	}
+	return result, nil
+}
+
+// WaitForNodesReady blocks until every listed instance has a Node that has
+// joined the cluster, reports Ready and is schedulable, or the timeout elapses.
+func (c *Client) WaitForNodesReady(ctx context.Context, instanceIDs []string, timeout, poll time.Duration) error {
+	if len(instanceIDs) == 0 {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		nodes, err := c.NodesForInstances(ctx, instanceIDs)
+		if err != nil {
+			return err
+		}
+		var pending []string
+		for _, id := range instanceIDs {
+			node, ok := nodes[id]
+			if !ok || !nodeReady(node) || node.Spec.Unschedulable {
+				pending = append(pending, id)
+			}
+		}
+		if len(pending) == 0 {
+			c.logf("all %d replacement node(s) are Ready", len(instanceIDs))
+			return nil
+		}
+		c.logf("waiting for %d/%d replacement node(s) to be Ready: %s",
+			len(pending), len(instanceIDs), strings.Join(pending, " "))
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s waiting for replacement node(s) to become Ready: %s",
+				timeout, strings.Join(pending, " "))
+		}
+		if err := sleep(ctx, poll); err != nil {
+			return err
+		}
+	}
+}
+
 // WaitForNodeReady blocks until the Node backing instanceID has joined the
 // cluster and reports Ready=True (and is not cordoned/unschedulable), or the
 // timeout elapses. This ensures the surge replacement can actually accept the
@@ -120,10 +182,8 @@ func sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// CordonAndDrain cordons then drains the node using the official kubectl drain
-// helper (respects PDBs, evicts pods, filters DaemonSets).
-func (c *Client) CordonAndDrain(ctx context.Context, node *corev1.Node) error {
-	helper := &drain.Helper{
+func (c *Client) drainHelper(ctx context.Context) *drain.Helper {
+	return &drain.Helper{
 		Ctx:                 ctx,
 		Client:              c.cs,
 		Force:               c.drainO.Force,
@@ -134,17 +194,34 @@ func (c *Client) CordonAndDrain(ctx context.Context, node *corev1.Node) error {
 		Out:                 logWriter{c.logf, "drain"},
 		ErrOut:              logWriter{c.logf, "drain-err"},
 	}
+}
 
-	if err := drain.RunCordonOrUncordon(helper, node, true); err != nil {
+// Cordon marks the node unschedulable so no further pods are placed on it. Safe
+// to call on an already-cordoned node.
+func (c *Client) Cordon(ctx context.Context, node *corev1.Node) error {
+	if err := drain.RunCordonOrUncordon(c.drainHelper(ctx), node, true); err != nil {
 		return fmt.Errorf("cordon node %s: %w", node.Name, err)
 	}
 	c.logf("cordoned node %s", node.Name)
+	return nil
+}
 
-	if err := drain.RunNodeDrain(helper, node.Name); err != nil {
+// Drain evicts the node's pods using the official kubectl drain helper
+// (respects PDBs, filters DaemonSets).
+func (c *Client) Drain(ctx context.Context, node *corev1.Node) error {
+	if err := drain.RunNodeDrain(c.drainHelper(ctx), node.Name); err != nil {
 		return fmt.Errorf("drain node %s: %w", node.Name, err)
 	}
 	c.logf("drained node %s", node.Name)
 	return nil
+}
+
+// CordonAndDrain cordons then drains the node.
+func (c *Client) CordonAndDrain(ctx context.Context, node *corev1.Node) error {
+	if err := c.Cordon(ctx, node); err != nil {
+		return err
+	}
+	return c.Drain(ctx, node)
 }
 
 // DeleteNode removes the Node object from the API server.

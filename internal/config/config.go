@@ -13,10 +13,6 @@ import (
 type Config struct {
 	// ASGNames is the explicit list of Auto Scaling Groups to manage.
 	ASGNames []string
-	// ASGTagKey / ASGTagValue optionally discover ASGs by tag when no explicit
-	// names are given.
-	ASGTagKey   string
-	ASGTagValue string
 
 	// Region is the AWS region. Empty means the SDK default chain decides.
 	Region string
@@ -40,6 +36,18 @@ type Config struct {
 	// ManageMaxSize temporarily raises MaxSize to allow the surge instance.
 	ManageMaxSize bool
 
+	// BatchMode selects the batched roll strategy instead of one node at a time:
+	// a wave of stale instances is surged together, then drained and terminated
+	// in batches. Off by default so it must be opted into per environment.
+	BatchMode bool
+	// BatchSize is how many Standby instances a batched roll drains and
+	// terminates together.
+	BatchSize int
+	// BatchMaxSurge caps how many instances a batched roll moves into Standby at
+	// once, bounding the extra capacity the ASG launches. 0 means no cap (every
+	// stale instance in a single wave).
+	BatchMaxSurge int
+
 	// Leader election / probes.
 	EnableLeaderElection bool
 	LeaderElectionID     string
@@ -55,11 +63,7 @@ func Load(args []string) (*Config, error) {
 	c := &Config{}
 
 	fs.StringVar(&asgNames, "asg-names", env("ASG_NAMES", ""),
-		"Comma-separated list of Auto Scaling Group names to manage.")
-	fs.StringVar(&c.ASGTagKey, "asg-tag-key", env("ASG_TAG_KEY", ""),
-		"Discover ASGs by this tag key when --asg-names is empty.")
-	fs.StringVar(&c.ASGTagValue, "asg-tag-value", env("ASG_TAG_VALUE", ""),
-		"Tag value to match together with --asg-tag-key.")
+		"Comma-separated list of Auto Scaling Group names to manage (required).")
 	fs.StringVar(&c.Region, "region", env("AWS_REGION", ""),
 		"AWS region (defaults to the SDK credential/region chain).")
 
@@ -85,6 +89,13 @@ func Load(args []string) (*Config, error) {
 		"Suspend the AZRebalance process during a roll.")
 	fs.BoolVar(&c.ManageMaxSize, "manage-max-size", envBool("MANAGE_MAX_SIZE", true),
 		"Temporarily raise MaxSize to allow the surge instance during a roll.")
+
+	fs.BoolVar(&c.BatchMode, "batch-mode", envBool("BATCH_MODE", false),
+		"Roll a wave of instances at once (surge, cordon, then drain/terminate in batches) instead of one node at a time.")
+	fs.IntVar(&c.BatchSize, "batch-size", envInt("BATCH_SIZE", 5),
+		"Batch mode: how many Standby instances to drain and terminate together.")
+	fs.IntVar(&c.BatchMaxSurge, "batch-max-surge", envInt("BATCH_MAX_SURGE", 10),
+		"Batch mode: max instances moved into Standby at once (0 = every stale instance in one wave).")
 
 	fs.BoolVar(&c.EnableLeaderElection, "leader-elect", envBool("LEADER_ELECT", true),
 		"Enable leader election so only one replica acts at a time.")
@@ -112,11 +123,19 @@ func Load(args []string) (*Config, error) {
 }
 
 func (c *Config) validate() error {
-	if len(c.ASGNames) == 0 && (c.ASGTagKey == "" || c.ASGTagValue == "") {
-		return fmt.Errorf("either --asg-names or both --asg-tag-key and --asg-tag-value must be set")
+	if len(c.ASGNames) == 0 {
+		return fmt.Errorf("--asg-names must be set")
 	}
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("--poll-interval must be positive")
+	}
+	if c.BatchMode {
+		if c.BatchSize < 1 {
+			return fmt.Errorf("--batch-size must be at least 1 when --batch-mode is set")
+		}
+		if c.BatchMaxSurge < 0 {
+			return fmt.Errorf("--batch-max-surge cannot be negative")
+		}
 	}
 	return nil
 }

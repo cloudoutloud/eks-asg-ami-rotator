@@ -29,19 +29,7 @@ func New(cfg *config.Config, awsC *awsclient.Client, kubeC *kube.Client, logf fu
 // ReconcileAll resolves the managed ASG list and reconciles each one. Errors on
 // individual ASGs are logged and do not abort the others.
 func (r *Rotator) ReconcileAll(ctx context.Context) error {
-	names := r.cfg.ASGNames
-	if len(names) == 0 {
-		discovered, err := r.aws.DiscoverByTag(ctx, r.cfg.ASGTagKey, r.cfg.ASGTagValue)
-		if err != nil {
-			return err
-		}
-		names = discovered
-	}
-	if len(names) == 0 {
-		r.logf("no ASGs to manage")
-		return nil
-	}
-	for _, name := range names {
+	for _, name := range r.cfg.ASGNames {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -52,15 +40,38 @@ func (r *Rotator) ReconcileAll(ctx context.Context) error {
 	return nil
 }
 
+// rollPlan is a single pass's view of an ASG: the AMI its instances should be
+// on, the instances stranded in Standby by an earlier pass, and the InService
+// instances still on an old AMI. Both roll strategies work from this, and both
+// derive it fresh each pass rather than tracking progress locally, so an
+// interrupted roll resumes from whatever state AWS reports.
+type rollPlan struct {
+	group   *awsclient.GroupState
+	target  string
+	standby []string
+	stale   []string
+}
+
 func (r *Rotator) reconcileASG(ctx context.Context, name string) error {
-	targetAMI, err := r.aws.ResolveTargetAMI(ctx, name)
+	plan, err := r.planRoll(ctx, name)
 	if err != nil {
 		return err
+	}
+	if r.cfg.BatchMode {
+		return r.reconcileBatch(ctx, plan)
+	}
+	return r.reconcileSerial(ctx, plan)
+}
+
+func (r *Rotator) planRoll(ctx context.Context, name string) (*rollPlan, error) {
+	targetAMI, err := r.aws.ResolveTargetAMI(ctx, name)
+	if err != nil {
+		return nil, err
 	}
 
 	gs, err := r.aws.DescribeGroup(ctx, name)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Instances left in Standby indicate a roll that a previous pass (or a crashed
@@ -78,7 +89,7 @@ func (r *Rotator) reconcileASG(ctx context.Context, name string) error {
 
 	amis, err := r.aws.InstanceAMIs(ctx, inService)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var stale []string
@@ -88,7 +99,17 @@ func (r *Rotator) reconcileASG(ctx context.Context, name string) error {
 		}
 	}
 
-	maxRestoreTarget := r.maxRestoreTarget(gs)
+	return &rollPlan{group: gs, target: targetAMI, standby: standby, stale: stale}, nil
+}
+
+// reconcileSerial rolls one instance at a time: each stale instance is surged,
+// waited on, drained and terminated before the next is touched.
+func (r *Rotator) reconcileSerial(ctx context.Context, p *rollPlan) error {
+	name, gs, targetAMI := p.group.Name, p.group, p.target
+	standby, stale := p.standby, p.stale
+
+	// One-at-a-time rolls only ever add a single surge instance.
+	maxRestoreTarget := r.maxRestoreTarget(gs, 1, 1)
 
 	if len(standby) == 0 && len(stale) == 0 {
 		r.logf("asg %s: all InService instances already on target AMI %s; no Standby to recover", name, targetAMI)
@@ -108,7 +129,7 @@ func (r *Rotator) reconcileASG(ctx context.Context, name string) error {
 
 	// Prepare the group for the roll (surge headroom + suspend rebalancing).
 	// MaxSize is restored only once the roll has settled (no Standby left).
-	restore, err := r.prepareGroup(ctx, gs)
+	restore, err := r.prepareGroup(ctx, gs, 1)
 	if err != nil {
 		return err
 	}
@@ -146,6 +167,7 @@ func (r *Rotator) reconcileASG(ctx context.Context, name string) error {
 			return err
 		}
 	}
+
 	for i, id := range stale {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -244,16 +266,17 @@ func (r *Rotator) decommissionStandby(ctx context.Context, asgName, instanceID s
 	return r.aws.WaitForStable(ctx, asgName, r.cfg.StabilizeTimeout, r.cfg.StabilizePoll, r.logf)
 }
 
-// prepareGroup raises MaxSize for the +1 surge and suspends AZRebalance,
-// returning a function that restores the original settings.
-func (r *Rotator) prepareGroup(ctx context.Context, gs *awsclient.GroupState) (func(), error) {
+// prepareGroup raises MaxSize by surge to make room for the replacement
+// instances the ASG will launch, suspends AZRebalance, and returns a function
+// that restores the original settings.
+func (r *Rotator) prepareGroup(ctx context.Context, gs *awsclient.GroupState, surge int32) (func(), error) {
 	name := gs.Name
 	origMax := gs.MaxSize
 	bumped := false
 	suspended := false
 
 	if r.cfg.ManageMaxSize {
-		needed := gs.DesiredCapacity + 1
+		needed := gs.DesiredCapacity + surge
 		if origMax < needed {
 			r.logf("asg %s: raising MaxSize %d -> %d for surge", name, origMax, needed)
 			if err := r.aws.SetMaxSize(ctx, name, needed); err != nil {
@@ -288,19 +311,28 @@ func (r *Rotator) prepareGroup(ctx context.Context, gs *awsclient.GroupState) (f
 	}, nil
 }
 
-// maxRestoreTarget returns the MaxSize to restore after a settled roll, or -1 if
-// ManageMaxSize is off or the current MaxSize was not raised (or left raised)
-// for surge headroom.
-func (r *Rotator) maxRestoreTarget(gs *awsclient.GroupState) int32 {
+// maxRestoreTarget returns the MaxSize to restore after a settled roll, or -1
+// when ManageMaxSize is off or the current MaxSize is higher than any ceiling
+// this controller would have raised (in which case it is the operator's value
+// and must be left alone).
+//
+// surge is the headroom this pass needs. band is the largest headroom the
+// controller could have added in an earlier pass; anything up to Desired+band is
+// treated as a ceiling of our own, which is what lets a restarted controller
+// still lower a ceiling it no longer has the in-memory context for.
+func (r *Rotator) maxRestoreTarget(gs *awsclient.GroupState, surge, band int32) int32 {
 	if !r.cfg.ManageMaxSize {
 		return -1
 	}
-	surge := gs.DesiredCapacity + 1
+	if band < surge {
+		band = surge
+	}
 	switch {
-	case gs.MaxSize < surge:
+	case gs.MaxSize < gs.DesiredCapacity+surge:
+		// Below what this pass needs: prepareGroup will raise it, so put back
+		// what we found.
 		return gs.MaxSize
-	case gs.MaxSize == surge:
-		// Likely still at the temporary surge ceiling from an earlier pass.
+	case gs.MaxSize <= gs.DesiredCapacity+band:
 		return gs.DesiredCapacity
 	default:
 		return -1
