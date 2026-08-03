@@ -156,7 +156,7 @@ func (r *Rotator) reconcileSerial(ctx context.Context, p *rollPlan) error {
 			return ctx.Err()
 		}
 		r.logf("asg %s: [recover %d/%d] decommissioning Standby instance %s", name, i+1, len(standby), id)
-		if err := r.decommissionStandby(ctx, name, id, false); err != nil {
+		if err := r.decommissionStandby(ctx, name, id); err != nil {
 			return fmt.Errorf("recover standby instance %s: %w", id, err)
 		}
 	}
@@ -168,15 +168,12 @@ func (r *Rotator) reconcileSerial(ctx context.Context, p *rollPlan) error {
 		}
 	}
 
-	outgoing := append([]string(nil), stale...)
-	cordonRemaining := false
-
 	for i, id := range stale {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		r.logf("asg %s: [%d/%d] rolling instance %s", name, i+1, len(stale), id)
-		if err := r.rollInstance(ctx, name, id, outgoing, &cordonRemaining); err != nil {
+		if err := r.rollInstance(ctx, name, id); err != nil {
 			return fmt.Errorf("roll instance %s: %w", id, err)
 		}
 		r.logf("asg %s: [%d/%d] instance %s rolled", name, i+1, len(stale), id)
@@ -189,11 +186,7 @@ func (r *Rotator) reconcileSerial(ctx context.Context, p *rollPlan) error {
 // rollInstance performs the full lifecycle for a single stale instance:
 // standby (surge a replacement on the new AMI), wait for that replacement to be
 // InService and Kubernetes-Ready, then decommission the old one.
-//
-// When outgoing and cordonRemaining are set (serial mode), all outgoing stale
-// nodes are cordoned before the first drain so evicted pods are not rescheduled
-// onto nodes still waiting to be rolled.
-func (r *Rotator) rollInstance(ctx context.Context, asgName, instanceID string, outgoing []string, cordonRemaining *bool) error {
+func (r *Rotator) rollInstance(ctx context.Context, asgName, instanceID string) error {
 	// Snapshot the InService instances so we can identify the replacement the
 	// ASG launches for the surge.
 	before, err := r.aws.InServiceInstanceIDs(ctx, asgName)
@@ -222,25 +215,14 @@ func (r *Rotator) rollInstance(ctx context.Context, asgName, instanceID string, 
 		return err
 	}
 
-	skipCordon := false
-	if cordonRemaining != nil {
-		if !*cordonRemaining {
-			if err := r.cordonAll(ctx, asgName, outgoing); err != nil {
-				return err
-			}
-			*cordonRemaining = true
-		}
-		skipCordon = true
-	}
-
-	return r.decommissionStandby(ctx, asgName, instanceID, skipCordon)
+	return r.decommissionStandby(ctx, asgName, instanceID)
 }
 
 // decommissionStandby drains, deletes, and terminates an instance that is
 // already in Standby. It is idempotent enough to also recover an instance left
 // in Standby by an interrupted earlier roll (cordon/drain on an already-drained
 // node is a no-op).
-func (r *Rotator) decommissionStandby(ctx context.Context, asgName, instanceID string, skipCordon bool) error {
+func (r *Rotator) decommissionStandby(ctx context.Context, asgName, instanceID string) error {
 	// Wait until the group is healthy (replacement in service) BEFORE draining,
 	// so the old node's pods have somewhere to land. This also guards the
 	// recovery path, where this method is called directly for an orphaned
@@ -256,10 +238,6 @@ func (r *Rotator) decommissionStandby(ctx context.Context, asgName, instanceID s
 	}
 	if node == nil {
 		r.logf("instance %s: no matching Kubernetes node found; skipping drain", instanceID)
-	} else if skipCordon || node.Spec.Unschedulable {
-		if err := r.kube.Drain(ctx, node); err != nil {
-			return err
-		}
 	} else {
 		if err := r.kube.CordonAndDrain(ctx, node); err != nil {
 			return err
