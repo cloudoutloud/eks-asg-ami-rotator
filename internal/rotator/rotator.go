@@ -40,6 +40,14 @@ func (r *Rotator) ReconcileAll(ctx context.Context) error {
 	return nil
 }
 
+func (r *Rotator) resolveTargetAMI(ctx context.Context, asgName string) (string, error) {
+	if r.cfg.AMIIDOverride != "" {
+		r.logf("asg %s: using AMI ID override %s (skipping launch-template resolution)", asgName, r.cfg.AMIIDOverride)
+		return r.cfg.AMIIDOverride, nil
+	}
+	return r.aws.ResolveTargetAMI(ctx, asgName)
+}
+
 // rollPlan is a single pass's view of an ASG: the AMI its instances should be
 // on, the instances stranded in Standby by an earlier pass, and the InService
 // instances still on an old AMI. Both roll strategies work from this, and both
@@ -64,9 +72,29 @@ func (r *Rotator) reconcileASG(ctx context.Context, name string) error {
 }
 
 func (r *Rotator) planRoll(ctx context.Context, name string) (*rollPlan, error) {
-	targetAMI, err := r.aws.ResolveTargetAMI(ctx, name)
+	targetAMI, err := r.resolveTargetAMI(ctx, name)
 	if err != nil {
 		return nil, err
+	}
+
+	// Safety guard: when the target AMI is pinned via --ami-id-override, verify
+	// the ASG launch template would actually launch that same AMI before doing
+	// anything. Replacements are launched by the ASG from its launch template,
+	// not by this controller, so a pin that disagrees with the launch template
+	// can never be satisfied — it would drain nodes only to have the ASG relaunch
+	// them on the launch-template AMI, churning forever. Refusing to roll here
+	// both protects the fleet and surfaces an accidental launch-template change.
+	if r.cfg.AMIIDOverride != "" && r.cfg.RequireLaunchTemplateMatch {
+		ltAMI, err := r.aws.ResolveTargetAMI(ctx, name)
+		if err != nil {
+			return nil, fmt.Errorf("verifying launch-template AMI against pinned %s: %w", r.cfg.AMIIDOverride, err)
+		}
+		if ltAMI != targetAMI {
+			r.logf("asg %s: WARNING launch-template AMI %s does not match pinned AMI %s; refusing to roll "+
+				"(launch template may have been changed unexpectedly). Set --require-launch-template-match=false to override.",
+				name, ltAMI, targetAMI)
+			return nil, fmt.Errorf("asg %s: launch-template AMI %s does not match pinned AMI %s; no action taken", name, ltAMI, targetAMI)
+		}
 	}
 
 	gs, err := r.aws.DescribeGroup(ctx, name)
@@ -246,7 +274,7 @@ func (r *Rotator) decommissionStandby(ctx context.Context, asgName, instanceID s
 
 	// Delete the Node object.
 	if node != nil {
-		if err := r.kube.DeleteNode(ctx, node.Name); err != nil {
+		if err := r.kube.DeleteNode(ctx, node); err != nil {
 			return err
 		}
 	}

@@ -17,6 +17,19 @@ type Config struct {
 	// Region is the AWS region. Empty means the SDK default chain decides.
 	Region string
 
+	// AMIIDOverride, when set, is the target AMI ID to roll onto instead of
+	// resolving from the ASG launch template. The launch template must still
+	// launch new instances with this AMI or replacements will not become healthy
+	// relative to the override.
+	AMIIDOverride string
+	// RequireLaunchTemplateMatch, when a pin (AMIIDOverride) is set, refuses to
+	// roll if the ASG launch template resolves to a different AMI than the pin.
+	// This turns the pin into a safety guard: it stops the controller acting on
+	// an accidental launch-template change (and avoids churning against surge
+	// replacements the ASG would launch on the wrong AMI). Ignored when no pin
+	// is set.
+	RequireLaunchTemplateMatch bool
+
 	// PollInterval is how often the reconcile loop runs.
 	PollInterval time.Duration
 	// StabilizeTimeout bounds how long we wait for the ASG to become healthy.
@@ -47,6 +60,10 @@ type Config struct {
 	// once, bounding the extra capacity the ASG launches. 0 means no cap (every
 	// stale instance in a single wave).
 	BatchMaxSurge int
+	// BatchStandbyBuffer leaves this many instances in Standby (with their
+	// replacements up) after each wave instead of draining them, so the next
+	// drain batch always has extra schedulable capacity. 0 disables the buffer.
+	BatchStandbyBuffer int
 
 	// Leader election / probes.
 	EnableLeaderElection bool
@@ -66,6 +83,11 @@ func Load(args []string) (*Config, error) {
 		"Comma-separated list of Auto Scaling Group names to manage (required).")
 	fs.StringVar(&c.Region, "region", env("AWS_REGION", ""),
 		"AWS region (defaults to the SDK credential/region chain).")
+
+	fs.StringVar(&c.AMIIDOverride, "ami-id-override", env("AMI_ID_OVERRIDE", ""),
+		"Target AMI ID to roll onto (ami-...). When set, skips launch-template/SSM resolution.")
+	fs.BoolVar(&c.RequireLaunchTemplateMatch, "require-launch-template-match", envBool("REQUIRE_LAUNCH_TEMPLATE_MATCH", true),
+		"When --ami-id-override is set, refuse to roll if the ASG launch template resolves to a different AMI (safety guard against accidental launch-template changes).")
 
 	fs.DurationVar(&c.PollInterval, "poll-interval", envDuration("POLL_INTERVAL", 60*time.Second),
 		"How often to reconcile the managed ASGs.")
@@ -96,6 +118,8 @@ func Load(args []string) (*Config, error) {
 		"Batch mode: how many Standby instances to drain and terminate together.")
 	fs.IntVar(&c.BatchMaxSurge, "batch-max-surge", envInt("BATCH_MAX_SURGE", 10),
 		"Batch mode: max instances moved into Standby at once (0 = every stale instance in one wave).")
+	fs.IntVar(&c.BatchStandbyBuffer, "batch-standby-buffer", envInt("BATCH_STANDBY_BUFFER", 0),
+		"Batch mode: instances to keep in Standby after each wave (with replacements up) as schedulable headroom for the next drain batch. Requires --batch-max-surge > buffer.")
 
 	fs.BoolVar(&c.EnableLeaderElection, "leader-elect", envBool("LEADER_ELECT", true),
 		"Enable leader election so only one replica acts at a time.")
@@ -136,6 +160,20 @@ func (c *Config) validate() error {
 		if c.BatchMaxSurge < 0 {
 			return fmt.Errorf("--batch-max-surge cannot be negative")
 		}
+		if c.BatchStandbyBuffer < 0 {
+			return fmt.Errorf("--batch-standby-buffer cannot be negative")
+		}
+		if c.BatchStandbyBuffer > 0 {
+			if c.BatchMaxSurge <= c.BatchStandbyBuffer {
+				return fmt.Errorf("--batch-max-surge must be greater than --batch-standby-buffer when buffer is set")
+			}
+		}
+	}
+	if o := strings.TrimSpace(c.AMIIDOverride); o != "" {
+		if !strings.HasPrefix(o, "ami-") {
+			return fmt.Errorf("--ami-id-override must be a valid AMI ID (ami-...)")
+		}
+		c.AMIIDOverride = o
 	}
 	return nil
 }

@@ -17,6 +17,24 @@ import (
 // instead of once per instance; the cost is that more capacity is in flight at
 // once, which is why the surge is capped and the mode is opt-in.
 func (r *Rotator) reconcileBatch(ctx context.Context, p *rollPlan) error {
+	if r.cfg.BatchStandbyBuffer > 0 {
+		return r.reconcileBatchBuffered(ctx, p)
+	}
+	return r.reconcileBatchUnbuffered(ctx, p)
+}
+
+// reconcileBatchUnbuffered rolls an ASG in waves rather than one instance at a time.
+//
+// Each wave has two phases. Phase 1 moves up to --batch-max-surge stale
+// instances into Standby together so the ASG launches all their replacements at
+// once, then waits for those replacements to join the cluster and report Ready.
+// Phase 2 cordons the outgoing nodes and drains and terminates them
+// --batch-size at a time.
+//
+// The win over the serial strategy is that a wave pays the node-boot wait once
+// instead of once per instance; the cost is that more capacity is in flight at
+// once, which is why the surge is capped and the mode is opt-in.
+func (r *Rotator) reconcileBatchUnbuffered(ctx context.Context, p *rollPlan) error {
 	name, targetAMI := p.group.Name, p.target
 
 	// Peak extra capacity is whichever is larger: instances a previous pass
@@ -87,6 +105,123 @@ func (r *Rotator) reconcileBatch(ctx context.Context, p *rollPlan) error {
 
 	r.logf("asg %s: batch roll complete; all instances on AMI %s", name, targetAMI)
 	return nil
+}
+
+// reconcileBatchBuffered is like reconcileBatchUnbuffered but keeps
+// --batch-standby-buffer instances in Standby after each wave (with their
+// replacements up) so the next drain batch always has extra schedulable capacity.
+//
+// Example with max-surge=4, batch-size=3, buffer=1: surge 4 into Standby,
+// drain 3, leave 1 buffered; next wave surges 3 more (pool back to 4), drains 3,
+// leaves 1 buffered; repeat until stale is exhausted, then drain the buffer.
+func (r *Rotator) reconcileBatchBuffered(ctx context.Context, p *rollPlan) error {
+	name, targetAMI := p.group.Name, p.target
+	buffer := r.cfg.BatchStandbyBuffer
+	maxSurge := r.cfg.BatchMaxSurge
+
+	surge := int32(maxSurge)
+	maxRestoreTarget := r.maxRestoreTarget(p.group, surge, surge)
+
+	if len(p.standby) == 0 && len(p.stale) == 0 {
+		r.logf("asg %s: all InService instances already on target AMI %s; no Standby to recover", name, targetAMI)
+		r.restoreMaxSizeWhenSettled(ctx, name, maxRestoreTarget)
+		return nil
+	}
+
+	r.logf("asg %s: batch roll (batch-size=%d, max-surge=%d, standby-buffer=%d); target AMI %s; %d stale, %d in Standby",
+		name, r.cfg.BatchSize, maxSurge, buffer, targetAMI, len(p.stale), len(p.standby))
+
+	restore, err := r.prepareGroup(ctx, p.group, surge)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		restore()
+		r.restoreMaxSizeWhenSettled(context.Background(), name, maxRestoreTarget)
+	}()
+
+	standby := append([]string(nil), p.standby...)
+	remaining := append([]string(nil), p.stale...)
+
+	// Resume interrupted decommission: more than buffer instances in Standby.
+	if len(standby) > buffer {
+		r.logf("asg %s: resuming interrupted wave: %d instance(s) in Standby (%d reserved as buffer)", name, len(standby), buffer)
+		toDrain := append([]string(nil), standby[buffer:]...)
+		if err := r.decommissionWave(ctx, name, toDrain, buildOutgoing(standby, remaining)); err != nil {
+			return err
+		}
+		standby = standby[:buffer]
+	}
+
+	wave := 0
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if len(remaining) == 0 {
+			if len(standby) == 0 {
+				break
+			}
+			r.logf("asg %s: final wave: draining %d buffered instance(s)", name, len(standby))
+			if err := r.decommissionWave(ctx, name, standby, buildOutgoing(standby, nil)); err != nil {
+				return err
+			}
+			break
+		}
+
+		if len(standby) < maxSurge {
+			n := surgeSizeBuffered(len(standby), len(remaining), maxSurge)
+			instances := remaining[:n]
+			remaining = remaining[n:]
+
+			wave++
+			r.logf("asg %s: wave %d: surging %d instance(s) (%d in Standby incl. buffer, %d stale after)",
+				name, wave, len(instances), len(standby), len(remaining))
+			if err := r.surgeWave(ctx, name, instances); err != nil {
+				return fmt.Errorf("surge wave %v: %w", instances, err)
+			}
+			standby = append(standby, instances...)
+		}
+
+		if len(standby) <= buffer {
+			continue
+		}
+		if len(standby) < maxSurge && len(remaining) > 0 {
+			continue
+		}
+
+		toDrain := append([]string(nil), standby[buffer:]...)
+		r.logf("asg %s: wave %d: draining %d instance(s); keeping %d in Standby as buffer",
+			name, wave, len(toDrain), buffer)
+		if err := r.decommissionWave(ctx, name, toDrain, buildOutgoing(standby, remaining)); err != nil {
+			return fmt.Errorf("decommission wave %v: %w", toDrain, err)
+		}
+		standby = standby[:buffer]
+	}
+
+	r.logf("asg %s: batch roll complete; all instances on AMI %s", name, targetAMI)
+	return nil
+}
+
+func buildOutgoing(standby, stale []string) []string {
+	outgoing := make([]string, 0, len(standby)+len(stale))
+	outgoing = append(outgoing, standby...)
+	outgoing = append(outgoing, stale...)
+	return outgoing
+}
+
+// surgeSizeBuffered is how many stale instances to move into Standby so the
+// Standby pool reaches --batch-max-surge without exceeding it.
+func surgeSizeBuffered(currentStandby, remainingStale, maxSurge int) int {
+	capacity := maxSurge - currentStandby
+	if capacity <= 0 || remainingStale <= 0 {
+		return 0
+	}
+	if remainingStale < capacity {
+		return remainingStale
+	}
+	return capacity
 }
 
 // waveSize is how many of the remaining stale instances one wave surges: all of
@@ -235,7 +370,7 @@ func (r *Rotator) drainBatch(ctx context.Context, batch []string) error {
 		if err := r.kube.Drain(ctx, node); err != nil {
 			return err
 		}
-		if err := r.kube.DeleteNode(ctx, node.Name); err != nil {
+		if err := r.kube.DeleteNode(ctx, node); err != nil {
 			return err
 		}
 	}

@@ -224,8 +224,37 @@ func (c *Client) CordonAndDrain(ctx context.Context, node *corev1.Node) error {
 	return c.Drain(ctx, node)
 }
 
-// DeleteNode removes the Node object from the API server.
-func (c *Client) DeleteNode(ctx context.Context, name string) error {
+// VerifyNodeDrainClean checks that no evictable workloads remain on the node.
+// DaemonSet and mirror pods left by a successful drain are allowed.
+func (c *Client) VerifyNodeDrainClean(ctx context.Context, node *corev1.Node) error {
+	list, errs := c.drainHelper(ctx).GetPodsForDeletion(node.Name)
+	if len(errs) > 0 {
+		return fmt.Errorf("verify node %s drain clean: %v", node.Name, errs)
+	}
+	remaining := list.Pods()
+	if len(remaining) == 0 {
+		c.logf("node %s: verified clean (no evictable workloads remain)", node.Name)
+		return nil
+	}
+	names := make([]string, len(remaining))
+	for i, p := range remaining {
+		names[i] = fmt.Sprintf("%s/%s", p.Namespace, p.Name)
+	}
+	return fmt.Errorf("node %s still has %d workload pod(s) after drain: %s",
+		node.Name, len(remaining), strings.Join(names, ", "))
+}
+
+// DeleteNode removes the Node object from the API server after verifying that
+// only DaemonSet/mirror pods remain.
+func (c *Client) DeleteNode(ctx context.Context, node *corev1.Node) error {
+	if err := c.VerifyNodeDrainClean(ctx, node); err != nil {
+		return err
+	}
+	return c.deleteNode(ctx, node.Name)
+}
+
+// deleteNode removes the Node object from the API server.
+func (c *Client) deleteNode(ctx context.Context, name string) error {
 	err := c.cs.CoreV1().Nodes().Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete node %s: %w", name, err)
