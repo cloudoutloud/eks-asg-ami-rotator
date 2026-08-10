@@ -40,13 +40,17 @@ type Config struct {
 	// a wave of stale instances is surged together, then drained and terminated
 	// in batches. Off by default so it must be opted into per environment.
 	BatchMode bool
-	// BatchSize is how many Standby instances a batched roll drains and
-	// terminates together.
+	// BatchSize is how many Standby instances a batched roll drains together
+	// per wave.
 	BatchSize int
 	// BatchMaxSurge caps how many instances a batched roll moves into Standby at
 	// once, bounding the extra capacity the ASG launches. 0 means no cap (every
 	// stale instance in a single wave).
 	BatchMaxSurge int
+	// BatchTerminateLast, when batch mode is on, deletes nodes and terminates
+	// Standby instances once after every wave has been drained. When false,
+	// each wave is terminated before the next wave surges (lower peak MaxSize).
+	BatchTerminateLast bool
 
 	// Leader election / probes.
 	EnableLeaderElection bool
@@ -91,11 +95,13 @@ func Load(args []string) (*Config, error) {
 		"Temporarily raise MaxSize to allow the surge instance during a roll.")
 
 	fs.BoolVar(&c.BatchMode, "batch-mode", envBool("BATCH_MODE", false),
-		"Roll a wave of instances at once (surge, cordon, then drain/terminate in batches) instead of one node at a time.")
+		"Roll in waves instead of one node at a time.")
 	fs.IntVar(&c.BatchSize, "batch-size", envInt("BATCH_SIZE", 5),
-		"Batch mode: how many Standby instances to drain and terminate together.")
+		"Batch mode: how many Standby instances to drain together per wave.")
 	fs.IntVar(&c.BatchMaxSurge, "batch-max-surge", envInt("BATCH_MAX_SURGE", 10),
 		"Batch mode: max instances moved into Standby at once (0 = every stale instance in one wave).")
+	fs.BoolVar(&c.BatchTerminateLast, "batch-terminate-last", envBool("BATCH_TERMINATE_LAST", false),
+		"Batch mode: delete nodes and terminate instances once after all waves are drained (requires MaxSize headroom for the full roll). When false, each wave is terminated before the next surges.")
 
 	fs.BoolVar(&c.EnableLeaderElection, "leader-elect", envBool("LEADER_ELECT", true),
 		"Enable leader election so only one replica acts at a time.")
