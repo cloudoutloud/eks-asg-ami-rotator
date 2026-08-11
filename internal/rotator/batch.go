@@ -3,6 +3,9 @@ package rotator
 import (
 	"context"
 	"fmt"
+	"strings"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 // reconcileBatch rolls an ASG in waves rather than one instance at a time.
@@ -182,8 +185,13 @@ func (r *Rotator) drainWave(ctx context.Context, name string, wave, outgoing []s
 		}
 		batch := wave[start:end]
 
-		r.logf("asg %s: [drain] batch %d/%d: draining %d node(s): %v", name, i, batches, len(batch), batch)
-		if err := r.drainBatch(ctx, batch); err != nil {
+		nodes, err := r.kube.NodesForInstances(ctx, batch)
+		if err != nil {
+			return err
+		}
+		r.logf("asg %s: [drain] batch %d/%d: draining %d node(s): %s",
+			name, i, batches, len(batch), formatDrainTargets(batch, nodes))
+		if err := r.drainBatch(ctx, batch, nodes); err != nil {
 			return err
 		}
 		r.logf("asg %s: [drain] batch %d/%d complete", name, i, batches)
@@ -214,7 +222,7 @@ func (r *Rotator) terminateRoll(ctx context.Context, name string, instances []st
 			r.logf("instance %s: no matching Kubernetes node found; skipping delete", id)
 			continue
 		}
-		if err := r.kube.DeleteNode(ctx, node.Name); err != nil {
+		if err := r.kube.DeleteNode(ctx, node); err != nil {
 			return err
 		}
 	}
@@ -258,10 +266,13 @@ func (r *Rotator) cordonAll(ctx context.Context, name string, instances []string
 
 // drainBatch drains the batch's nodes one at a time. Draining sequentially
 // keeps evictions from piling up against PodDisruptionBudgets.
-func (r *Rotator) drainBatch(ctx context.Context, batch []string) error {
-	nodes, err := r.kube.NodesForInstances(ctx, batch)
-	if err != nil {
-		return err
+func (r *Rotator) drainBatch(ctx context.Context, batch []string, nodes map[string]*corev1.Node) error {
+	if nodes == nil {
+		var err error
+		nodes, err = r.kube.NodesForInstances(ctx, batch)
+		if err != nil {
+			return err
+		}
 	}
 	for _, id := range batch {
 		if ctx.Err() != nil {
@@ -277,4 +288,16 @@ func (r *Rotator) drainBatch(ctx context.Context, batch []string) error {
 		}
 	}
 	return nil
+}
+
+func formatDrainTargets(ids []string, nodes map[string]*corev1.Node) string {
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if n, ok := nodes[id]; ok {
+			parts = append(parts, fmt.Sprintf("%s (%s)", id, n.Name))
+		} else {
+			parts = append(parts, id)
+		}
+	}
+	return strings.Join(parts, ", ")
 }

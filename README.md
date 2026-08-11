@@ -30,9 +30,28 @@ On a timer, for each managed ASG:
    work so they can't be orphaned.
 3. **Find `InService` instances on an old AMI.** If there are none (and nothing
    to recover), it does nothing.
-4. Prepare the group: temporarily **raise `MaxSize`** to allow the +1 surge and
-   **suspend `AZRebalance`**.
-5. For each stale instance, **one at a time**:
+4. Prepare the group: temporarily **raise `MaxSize`** to make room for the surge
+   and **suspend `AZRebalance`**.
+5. **Roll the stale instances** using one of two strategies — see
+   [Roll strategies](#roll-strategies).
+6. Restore `MaxSize` (once no instances remain in `Standby`) and resume
+   `AZRebalance`.
+
+Instance → Node mapping is done via the node's `spec.providerID`
+(`aws:///<az>/<instance-id>`).
+
+## Roll strategies
+
+The controller has two modes. **Serial is the default**; batch is opt-in via
+`--batch-mode` / `BATCH_MODE` so it can be enabled per environment.
+
+Both modes derive all their state from AWS and Kubernetes on every pass and
+store nothing locally, so an interrupted roll (crashed leader, lost leader
+election, failed drain) resumes from whatever state the ASG reports.
+
+### Serial — one instance at a time (default)
+
+For each stale instance, in turn:
    1. `EnterStandby` (without decrementing desired) → the ASG launches a
       replacement on the new AMI.
    2. **Wait for the replacement to be usable** before touching the old node:
@@ -41,15 +60,105 @@ On a timer, for each managed ASG:
       schedulable). This guarantees evicted pods have somewhere to land.
    3. **Cordon and drain** the backing Kubernetes node (respects
       PodDisruptionBudgets; ignores DaemonSets).
-   4. **Delete the Node** object.
+   4. **Verify** no evictable workloads remain (DaemonSet/mirror pods allowed),
+      then **delete the Node** object.
    5. **Terminate** the old instance through the ASG with
       `TerminateInstanceInAutoScalingGroup` **without decrementing desired**, so
       the healthy replacement is not scaled back down.
-6. Restore `MaxSize` (once no instances remain in `Standby`) and resume
-   `AZRebalance`.
 
-Instance → Node mapping is done via the node's `spec.providerID`
-(`aws:///<az>/<instance-id>`).
+Safest and slowest: only ever one extra instance, and only one node draining at
+a time. Rolling *n* nodes costs *n* node-boot waits.
+
+### Batch — waves of instances (`--batch-mode`)
+
+Stale instances are rolled in **waves** of up to `--batch-max-surge`. Each wave
+runs two phases.
+
+**Phase 1 — surge:**
+
+1. `EnterStandby` for **every instance in the wave at once** (without
+   decrementing desired) → the ASG launches a replacement for each.
+2. Wait for all replacements to become `InService`/`Healthy`.
+3. Wait for all their Kubernetes Nodes to join and report `Ready`.
+
+**Phase 2 — decommission:**
+
+4. **Cordon every node still on an old AMI** — not just this wave's, but every
+   remaining stale node and any node already in `Standby`. See
+   [why the cordon is fleet-wide](#why-the-cordon-is-fleet-wide-but-late).
+5. **Drain** `--batch-size` nodes at a time (sequentially within each batch,
+   respecting PodDisruptionBudgets).
+6. **Verify** no evictable workloads remain, **delete Node objects and terminate
+   instances** — either after **each wave** (default) or **once at the end of
+   the roll** when `--batch-terminate-last` is set. See
+   [Termination timing](#termination-timing).
+7. Wait for the group to settle before the next wave (per-wave termination
+   only).
+
+The saving is that a wave pays the node-boot wait **once** instead of once per
+instance. The cost is more capacity in flight, which is what `--batch-max-surge`
+bounds.
+
+#### Termination timing
+
+Controlled by `--batch-terminate-last` / `BATCH_TERMINATE_LAST`:
+
+| Setting | Behavior | Peak `MaxSize` headroom |
+|---------|----------|-------------------------|
+| `false` (default) | Surge → drain → **terminate each wave** before the next surges | `Desired + batch-max-surge` |
+| `true` | Surge and drain **all waves**, then **one** bulk node delete and instance terminate at the end | `Desired + full roll size` |
+
+Use `--batch-terminate-last=true` when terminate waits dominate wall clock and
+you have headroom for every replaced instance to sit in `Standby` until the
+roll finishes draining. Keep the default when you want lower peak capacity
+during the roll.
+
+Example:
+
+```yaml
+- --batch-mode=true
+- --batch-size=5
+- --batch-max-surge=10
+- --batch-terminate-last=true
+```
+
+#### Why the cordon is fleet-wide but late
+
+Two separate decisions, both about where evicted pods end up.
+
+**Fleet-wide, not per wave.** If only the current wave were cordoned, a pod
+evicted in wave 1 could be scheduled onto a stale node in wave 3 — and evicted
+again when wave 3 comes round. On a 70-instance ASG rolled 10 at a time that is
+up to seven moves for the same pod. Cordoning every outgoing node means each pod
+moves **once**, onto a node on the new AMI.
+
+**After phase 1, not before.** Cordoning stale nodes before their replacements
+are `Ready` would leave the group with nothing schedulable for the several
+minutes a node takes to boot and join. Waiting until the first wave's
+replacements are up means there is always somewhere for pods to land.
+
+Cordoning is idempotent and re-checked each wave, so nodes stay cordoned across
+controller restarts. Note that a roll which halts permanently leaves the
+remaining stale nodes cordoned — they keep running their existing pods, but take
+no new ones until the roll completes or an operator uncordons them.
+
+#### Sizing batch flags
+
+| Flag | Bounds |
+|------|--------|
+| `--batch-max-surge` | How many **extra** instances exist at peak per wave (or for the full roll with `--batch-terminate-last`), and so how much `MaxSize` headroom and EC2 quota a roll needs |
+| `--batch-size` | How many nodes are drained together, and so how much disruption pods see at once |
+| `--batch-terminate-last` | Whether termination happens per wave (`false`) or once after all waves are drained (`true`) |
+
+`--batch-max-surge` may be smaller than the number of stale instances; the roll
+just takes more waves. Setting it (rather than leaving it `0` for unlimited) also
+lets a restarted controller recognise and lower a `MaxSize` ceiling it raised in
+an earlier pass.
+
+For a 70-instance ASG, `--batch-max-surge=10` with `--batch-size=5` gives seven
+waves, each surging 10 replacements and then draining them in two batches of
+five — so at most 10 extra instances and 5 nodes draining at any moment, and
+seven node-boot waits instead of 70.
 
 ## How AMI detection works
 
@@ -58,14 +167,32 @@ compares **two AMI IDs**:
 
 | | Source |
 |---|--------|
-| **Target AMI** | What the ASG would launch *today* (from its launch template / launch configuration) |
-| **Actual AMI** | What each `InService` instance is running (from EC2 `DescribeInstances`) |
+| **Target AMI** | Launch template / launch configuration on the ASG, **or** `--ami-id-override` / `AMI_ID_OVERRIDE` when set |
+| **Actual AMI** | Each `InService` instance's AMI (from EC2 `DescribeInstances`) |
 
-If **actual ≠ target**, that instance is stale and gets rolled one at a time.
-If every `InService` instance already matches the target, it does nothing.
+If **actual ≠ target**, that instance is stale and gets rolled (serially or in a
+batch, depending on the mode). If every `InService` instance already matches the
+target, it does nothing.
 
 Updating the launch template (or the value behind an SSM alias) is what triggers
 a roll — the controller simply notices the ID mismatch on the next poll.
+
+Alternatively, set **`--ami-id-override`** / **`AMI_ID_OVERRIDE`** to pin a
+specific `ami-...` as the target for all managed ASGs (skips launch-template
+resolution). The ASG launch template must still launch **new** instances with that
+same AMI ID, or surge replacements will never match the override and the roll
+will not complete.
+
+**Pin as a safety guard.** A common workflow is: (1) bump the launch template to
+the new AMI and let the controller roll onto it, then (2) pin
+`--ami-id-override` to that same AMI. Once pinned, an *accidental* later change
+to the launch template is ignored — the controller's target stays the pinned
+AMI, so nodes already on it are left alone. To make this robust, the controller
+verifies the pin against the launch template each reconcile: if
+**`--require-launch-template-match`** is enabled (the default when a pin is set)
+and the launch template resolves to a **different** AMI than the pin, the
+controller **refuses to roll** and logs a warning + reconcile error (rather than
+churning). Set `--require-launch-template-match=false` to disable this check.
 
 ### Resolving the target AMI
 
@@ -104,8 +231,16 @@ same lookup mechanism.
 
 ## Notes & safety
 
-- **One instance at a time**, and each step waits for the ASG to be healthy
-  before proceeding — a failed drain or unhealthy replacement halts the roll.
+- **Replacements are always proven usable before anything is drained** — the
+  controller waits for them to be `InService`/`Healthy` at the ASG level *and*
+  for their Nodes to report `Ready` and schedulable. A failed drain or unhealthy
+  replacement halts the roll rather than pressing on.
+- **Node delete is gated on a clean drain** — before removing the Node object,
+  the controller lists pods on the node and refuses to proceed if any
+  non-DaemonSet workloads remain.
+- A halted roll is **retried on the next poll**, picking up from the live ASG
+  state. Cordon is idempotent and draining an already-drained node is a no-op, so
+  retries are safe.
 - Cleanup (resume `AZRebalance`) runs even if the process is cancelled mid-roll.
   **`MaxSize` is only restored once the roll has settled** (no instances left in
   `Standby`), so a failed or interrupted roll keeps surge headroom for the next
@@ -122,7 +257,7 @@ The controller **refuses to start** unless `--asg-names` / `ASG_NAMES` is set
 
 | Option | Flag / env | Example |
 |--------|------------|---------|
-| **Explicit ASG names** | `--asg-names` or `ASG_NAMES` | `ASG_NAMES=eks-nodes-dev,eks-nodes-prod` |
+| **ASG names** | `--asg-names` or `ASG_NAMES` | `ASG_NAMES=eks-nodes-dev,eks-nodes-prod` |
 
 Everything else in the table below is **optional** and has a default. The only
 other validated setting is `--poll-interval` / `POLL_INTERVAL`, which must be
@@ -138,8 +273,9 @@ working in-cluster deploy):
 | IRSA role ARN | ServiceAccount annotation in [`deploy/rbac.yaml`](deploy/rbac.yaml) | AWS API access |
 | Container image | Deployment | Which controller version to run |
 
-There is **no** controller flag for target AMI — that comes from the ASG launch
-template in AWS (see [How AMI detection works](#how-ami-detection-works)).
+By default the target AMI comes from the ASG launch template in AWS (see
+[How AMI detection works](#how-ami-detection-works)). Optionally pin it with
+`--ami-id-override` / `AMI_ID_OVERRIDE` instead.
 
 ### All flags
 
@@ -147,7 +283,9 @@ Flags (each has an env fallback, shown in parentheses):
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
-| `--asg-names` | `ASG_NAMES` | – | Comma-separated ASG names to manage. **Required.** |
+| `--asg-names` | `ASG_NAMES` | – | Comma-separated ASG names to manage (**required**). |
+| `--ami-id-override` | `AMI_ID_OVERRIDE` | – | Pin target AMI ID (`ami-...`); skips launch-template/SSM resolution. Launch template must still launch this AMI. |
+| `--require-launch-template-match` | `REQUIRE_LAUNCH_TEMPLATE_MATCH` | `true` | With a pin set, refuse to roll (warn + error) if the launch template resolves to a different AMI. Safety guard against accidental launch-template changes. |
 | `--region` | `AWS_REGION` | SDK default | AWS region. |
 | `--poll-interval` | `POLL_INTERVAL` | `60s` | Reconcile cadence. |
 | `--stabilize-timeout` | `STABILIZE_TIMEOUT` | `20m` | Max wait for the ASG to become healthy. |
@@ -159,39 +297,11 @@ Flags (each has an env fallback, shown in parentheses):
 | `--delete-emptydir-data` | `DELETE_EMPTYDIR_DATA` | `true` | Allow eviction of emptyDir pods. |
 | `--suspend-azrebalance` | `SUSPEND_AZREBALANCE` | `true` | Suspend AZRebalance during a roll. |
 | `--manage-max-size` | `MANAGE_MAX_SIZE` | `true` | Temporarily raise MaxSize for surge. |
-| `--batch-mode` | `BATCH_MODE` | `false` | Roll in waves instead of one node at a time. |
-| `--batch-size` | `BATCH_SIZE` | `5` | Batch mode: how many Standby instances to drain together per wave. |
-| `--batch-max-surge` | `BATCH_MAX_SURGE` | `10` | Batch mode: max instances moved into Standby at once (`0` = one wave for all stale). |
-| `--batch-terminate-last` | `BATCH_TERMINATE_LAST` | `false` | Batch mode: delete nodes and terminate instances once after all waves are drained. |
+| `--batch-mode` | `BATCH_MODE` | `false` | Roll in waves instead of one node at a time. See [Roll strategies](#roll-strategies). |
+| `--batch-size` | `BATCH_SIZE` | `5` | Batch mode: nodes drained and terminated together. |
+| `--batch-max-surge` | `BATCH_MAX_SURGE` | `10` | Batch mode: max instances moved into `Standby` at once (`0` = every stale instance in one wave). |
+| `--batch-terminate-last` | `BATCH_TERMINATE_LAST` | `false` | Batch mode: delete nodes and terminate instances once after all waves are drained. When `false`, each wave is terminated before the next surges. See [Termination timing](#termination-timing). |
 | `--leader-elect` | `LEADER_ELECT` | `true` | Leader election (safe with >1 replica). If more than one replica for HA only one pod will run controller loop to avoid clash |
-
-### Batch mode
-
-With `--batch-mode=true`, the controller surges up to `--batch-max-surge` stale
-instances into Standby at once, waits for their replacements to join and report
-Ready, then drains them in groups of `--batch-size`. This pays the node-boot
-wait once per wave instead of once per instance.
-
-**Termination timing** is controlled by `--batch-terminate-last`:
-
-| Setting | Behavior | Peak `MaxSize` |
-|---------|----------|----------------|
-| `false` (default) | Surge → drain → terminate **each wave** before the next surges | `Desired + batch-max-surge` |
-| `true` | Surge and drain all waves, then **one** node delete and instance terminate at the end | `Desired + full roll size` |
-
-Use `--batch-terminate-last=true` when terminate waits dominate wall clock and
-you have headroom for every replaced instance to sit in Standby until the roll
-finishes draining. Keep the default when you want lower peak capacity during the
-roll.
-
-Example deployment args:
-
-```yaml
-- --batch-mode=true
-- --batch-size=2
-- --batch-max-surge=3
-- --batch-terminate-last=true
-```
 
 ## AWS permissions (IRSA)
 
