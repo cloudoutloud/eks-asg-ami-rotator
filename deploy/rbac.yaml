@@ -4,8 +4,6 @@ kind: ServiceAccount
 metadata:
   name: asg-ami-rotator
   namespace: asg-ami-rotator
-  annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/asg-ami-rotater
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

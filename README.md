@@ -268,10 +268,8 @@ working in-cluster deploy):
 
 | Setting | Where | Why |
 |---------|--------|-----|
-| `AWS_REGION` / `--region` | Deployment env or args | Avoid ambiguous region with IRSA; must match the ASG |
+| `AWS_REGION` / `--region` | Deployment env or args | Avoid ambiguous region; must match the ASG |
 | `POD_NAMESPACE` | Deployment env (downward API) | Leader-election lease namespace; set in [`deploy/deployment.yaml`](deploy/deployment.yaml) |
-| IRSA role ARN | ServiceAccount annotation in [`deploy/rbac.yaml`](deploy/rbac.yaml) | AWS API access |
-| Container image | Deployment | Which controller version to run |
 
 By default the target AMI comes from the ASG launch template in AWS (see
 [How AMI detection works](#how-ami-detection-works)). Optionally pin it with
@@ -303,14 +301,21 @@ Flags (each has an env fallback, shown in parentheses):
 | `--batch-terminate-last` | `BATCH_TERMINATE_LAST` | `false` | Batch mode: delete nodes and terminate instances once after all waves are drained. When `false`, each wave is terminated before the next surges. See [Termination timing](#termination-timing). |
 | `--leader-elect` | `LEADER_ELECT` | `true` | Leader election (safe with >1 replica). If more than one replica for HA only one pod will run controller loop to avoid clash |
 
-## AWS permissions (IRSA)
+## AWS permissions (EKS Pod Identity)
 
-Pre req your need to create an IAM role for the controller.
+Prerequisites:
 
-Attach the policy in [`deploy/iam-policy.json`](deploy/iam-policy.json) to the
-IAM role referenced by the ServiceAccount's `eks.amazonaws.com/role-arn`
-annotation. It grants read-only describes plus the ASG/EC2 mutations the roll
-needs. Scope the `Resource`/conditions to your bootstrap ASGs in production.
+1. Install the [EKS Pod Identity Agent](https://docs.aws.amazon.com/eks/latest/userguide/pod-id-agent-setup.html)
+   add-on on the cluster.
+2. Create an IAM role for the controller with the trust policy in
+   [`deploy/trust-policy.json`](deploy/trust-policy.json).
+3. Attach the permissions policy in [`deploy/iam-policy.json`](deploy/iam-policy.json).
+   It grants read-only describes plus the ASG/EC2 mutations the roll needs.
+   Scope the `Resource`/conditions to your bootstrap ASGs in production.
+4. Create the Pod Identity association (links the role to the service account):
+
+Unlike IRSA, Pod Identity does not use a ServiceAccount annotation or an
+OIDC-based trust policy — the association is managed through the EKS API.
 
 ## Kubernetes permissions
 
@@ -324,7 +329,7 @@ create evictions, read workload controllers, and manage a leader-election lease.
 First set the tag/image and log in to ECR:
 
 ```bash
-export TAG=v0.2.0
+export TAG=v0.x.x
 export IMAGE=ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/images/asg-ami-rotater:$TAG
 
 aws ecr get-login-password --region REGION \
@@ -376,7 +381,8 @@ docker push "$IMAGE"
 ```bash
 make tidy          # resolve go.sum
 make build         # build the binary locally (optional)
-# edit deploy/*.yaml: image, ASG_NAMES, AWS_REGION, IRSA role ARN
+# edit deploy/*.yaml: image, ASG_NAMES, AWS_REGION
+# create Pod Identity association (see AWS permissions section)
 # apply k8s manifests
 make deploy
 ```

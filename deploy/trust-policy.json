@@ -2,17 +2,15 @@
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "AllowEksAuthToAssumeRoleForPodIdentity",
       "Effect": "Allow",
       "Principal": {
-        "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/oidc.eks.REGION.amazonaws.com/id/OIDC_ID"
+        "Service": "pods.eks.amazonaws.com"
       },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "oidc.eks.REGION.amazonaws.com/id/OIDC_ID:aud": "sts.amazonaws.com",
-          "oidc.eks.REGION.amazonaws.com/id/OIDC_ID:sub": "system:serviceaccount:asg-ami-rotator:asg-ami-rotator"
-        }
-      }
+      "Action": [
+        "sts:AssumeRole",
+        "sts:TagSession"
+      ]
     }
   ]
 }
