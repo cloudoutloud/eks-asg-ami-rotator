@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1
+#
+# Package a controller binary built on the host (see README).
+# Expects ./controller in the build context:
+#
+#   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" \
+#     -o controller ./cmd/controller
+#   docker buildx build --platform linux/amd64 -f Dockerfile.prebuilt -t "$IMAGE" --load .
+
+FROM gcr.io/distroless/static:nonroot
+WORKDIR /
+COPY controller /controller
+USER 65532:65532
+ENTRYPOINT ["/controller"]
